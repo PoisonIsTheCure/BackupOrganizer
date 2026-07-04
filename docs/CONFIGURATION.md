@@ -15,7 +15,11 @@ default. Paths may use `~`.
   "chunk_mb": 500,
   "keep_local_chunks": false,
   "min_free_gb": 2,
-  "exclude": [".DS_Store", "*.tmp", "._*", ".localized"]
+  "exclude": [
+    ".DS_Store", "*.tmp", "._*", ".localized",
+    ".venv", "venv", ".v", "node_modules", "__pycache__", "*.pyc", "*.pyo",
+    ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox", ".ipynb_checkpoints"
+  ]
 }
 ```
 
@@ -30,7 +34,7 @@ default. Paths may use `~`.
 | `chunk_mb` | Target chunk size in MB. Files are first-fit packed up to this cap; a **file larger than the cap gets its own dedicated chunk** — it is never split. Bigger chunks = fewer remote files but more data to re-upload per change and to download per restore. |
 | `keep_local_chunks` | `false` (default): local chunk zips are deleted once uploaded — Proton Drive is the only copy and disk space is freed. `true`: keep local copies too (uses disk, but restores never download). |
 | `min_free_gb` | Safety margin: a backup aborts (with a notification) if building its chunks would leave less than this much free disk space. |
-| `exclude` | Glob patterns matched against file **and directory names** (not full paths). Matching items are ignored everywhere: sync dirs, dropzone, and `--advice` scans. |
+| `exclude` | Glob patterns matched against file **and directory names** (not full paths). Matching items are ignored everywhere: sync dirs, dropzone, and `--advice` scans. The defaults skip regenerable dev artifacts (virtualenvs, `node_modules`, caches); `.git` is deliberately *not* excluded, since unpushed history is irreplaceable. |
 
 ## Multiple configurations
 

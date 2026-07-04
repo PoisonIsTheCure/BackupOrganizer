@@ -22,8 +22,9 @@ the one chunk that contains it.
   manifest, downloads just its chunk, extracts and hash-verifies it.
 - **Backup browser** — `--browse` renders the whole backup as an interactive
   HTML page (collapsible folders, live search, sizes, chunk badges) built
-  purely from the manifest — browsing costs zero downloads. `--tree` prints
-  the same structure in the terminal.
+  purely from the manifest — browsing costs zero downloads. Every folder and
+  file has a ⬇ button that copies the matching restore command to the
+  clipboard. `--tree` prints the same structure in the terminal.
 - **Manifest state tracking** — `manifest.json` records the path, size, mtime,
   SHA-256 and chunk of every file. Diffing is I/O-efficient: unchanged files
   cost one `stat()` call, zero reads.
@@ -74,7 +75,8 @@ and upload pipeline works.
 | `--advice DIR` | Report which files in `DIR` are safely backed up |
 | `--tree [PREFIX]` | Print the backed-up file tree, optionally under a path prefix |
 | `--browse [OUT]` | Generate an interactive HTML backup browser and open it |
-| `--restore NAME` | Restore file(s) matching a name/substring/glob (see `--dest`) |
+| `--restore NAME` | Restore file(s) by name/substring/glob, or a whole folder with a trailing `/` |
+| `--restore-all` | Download and restore the entire backup (see `--dest`) |
 | `--dest DIR` | Destination for `--restore` (default: `~/Downloads/BackupOrganizer-Restore`) |
 | `--init` | Write a default `config.json` and create the dropzone |
 | `--no-upload` | Build chunks locally only; nothing is deleted or trashed |

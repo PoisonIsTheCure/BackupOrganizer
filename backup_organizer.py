@@ -78,7 +78,12 @@ DEFAULT_CONFIG = {
     "chunk_mb": 500,
     "keep_local_chunks": False,
     "min_free_gb": 2,
-    "exclude": [".DS_Store", "*.tmp", "._*", ".localized"],
+    "exclude": [
+        ".DS_Store", "*.tmp", "._*", ".localized",
+        # regenerable dev directories/files — cheap to rebuild, churn-heavy
+        ".venv", "venv", ".v", "node_modules", "__pycache__", "*.pyc", "*.pyo",
+        ".pytest_cache", ".mypy_cache", ".ruff_cache", ".tox", ".ipynb_checkpoints",
+    ],
 }
 
 
@@ -941,12 +946,19 @@ def cmd_advice(cfg: Config, target: Path) -> int:
 
 
 def cmd_restore(cfg: Config, pattern: str, dest: Path) -> int:
-    """Restore files by name/glob, downloading only the chunks that hold them."""
+    """Restore files by name/glob/folder, downloading only their chunks.
+
+    A pattern ending in "/" restores exactly that folder subtree; otherwise
+    globs and case-insensitive substrings match anywhere in the path.
+    """
     manifest = Manifest.load(cfg.manifest_path)
-    matches = sorted(
-        arc for arc in manifest.files
-        if fnmatch.fnmatchcase(arc, pattern) or pattern.lower() in arc.lower()
-    )
+    if pattern.endswith("/"):
+        matches = sorted(arc for arc in manifest.files if arc.startswith(pattern))
+    else:
+        matches = sorted(
+            arc for arc in manifest.files
+            if fnmatch.fnmatchcase(arc, pattern) or pattern.lower() in arc.lower()
+        )
     if not matches:
         print(f"No backed-up file matches {pattern!r}. Try --status or a broader pattern.")
         return 1
@@ -1073,9 +1085,18 @@ BROWSER_HTML = """<!DOCTYPE html>
   .b-pend { background: var(--pending); color: var(--pending-fg); }
   .hide { display: none; }
   .dim { color: var(--muted); }
+  .dl { visibility: hidden; font: inherit; font-size: .78em; cursor: pointer;
+        border: 1px solid var(--muted); border-radius: 5px; background: transparent;
+        color: var(--fg); padding: .02em .5em; margin-left: .6em; }
+  summary:hover .dl, .file:hover .dl, .dl.ok { visibility: visible; }
+  .hint { color: var(--muted); font-size: .85em; margin: -.5em 0 1em; }
+  .hint code { font-family: ui-monospace, monospace; }
 </style></head><body>
 <h1>Backup contents</h1>
 <div class="meta">__META__</div>
+<p class="hint">⬇ copies a restore command — paste it in Terminal to download that
+file or folder from Proton Drive. Entire backup:
+<code>backup-organizer --restore-all --dest ~/some/folder</code></p>
 <input id="q" type="search" placeholder="Search files… (name or path)" autofocus>
 <div id="tree"></div>
 <script>
@@ -1094,13 +1115,31 @@ for (const f of FILES) {
   node.files.push(f);
 }
 const fileEls = [];
-function render(node, parent, depth) {
+function copyText(t) {
+  if (navigator.clipboard) return navigator.clipboard.writeText(t);
+  const ta = document.createElement("textarea"); ta.value = t;
+  document.body.append(ta); ta.select(); document.execCommand("copy"); ta.remove();
+  return Promise.resolve();
+}
+function dlButton(path, isDir) {
+  const b = document.createElement("button"); b.className = "dl"; b.textContent = "⬇";
+  b.title = "Copy the Terminal command that downloads " + (isDir ? "this folder" : "this file");
+  b.onclick = ev => {
+    ev.preventDefault(); ev.stopPropagation();
+    const quoted = "'" + (path + (isDir ? "/" : "")).replaceAll("'", "'\\''") + "'";
+    copyText("backup-organizer --restore " + quoted);
+    b.textContent = "✓ copied — paste in Terminal"; b.classList.add("ok");
+    setTimeout(() => { b.textContent = "⬇"; b.classList.remove("ok"); }, 1800);
+  };
+  return b;
+}
+function render(node, parent, depth, prefix) {
   for (const [name, sub] of [...node.dirs].sort((a, b) => a[0].localeCompare(b[0]))) {
     const d = document.createElement("details"); if (depth === 0) d.open = true;
     const s = document.createElement("summary");
     s.append("📁 " + name, Object.assign(document.createElement("span"),
-      { className: "sz", textContent: human(sub.size) }));
-    d.append(s); parent.append(d); render(sub, d, depth + 1);
+      { className: "sz", textContent: human(sub.size) }), dlButton(prefix + name, true));
+    d.append(s); parent.append(d); render(sub, d, depth + 1, prefix + name + "/");
   }
   for (const [path, size, chunk, up, src] of node.files) {
     const el = document.createElement("div"); el.className = "file"; el.dataset.p = path.toLowerCase();
@@ -1109,11 +1148,12 @@ function render(node, parent, depth) {
       textContent: chunk + (up ? "" : " · not uploaded"),
       title: up ? "Uploaded " + up : "Awaiting upload" });
     el.append("📄 " + path.split("/").pop(),
-      Object.assign(document.createElement("span"), { className: "sz", textContent: human(size) }), badge);
+      Object.assign(document.createElement("span"), { className: "sz", textContent: human(size) }),
+      badge, dlButton(path, false));
     parent.append(el); fileEls.push(el);
   }
 }
-render(root, document.getElementById("tree"), 0);
+render(root, document.getElementById("tree"), 0, "");
 document.getElementById("q").addEventListener("input", e => {
   const q = e.target.value.trim().toLowerCase();
   for (const el of fileEls) el.classList.toggle("hide", q !== "" && !el.dataset.p.includes(q));
@@ -1208,7 +1248,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--browse", metavar="OUT", nargs="?", const="", type=str,
                         help="generate an interactive HTML browser of the backup and open it")
     parser.add_argument("--restore", metavar="NAME",
-                        help="restore file(s) matching a name, substring or glob")
+                        help="restore file(s)/folder(s) matching a name, substring, "
+                             "glob, or folder path ending in /")
+    parser.add_argument("--restore-all", action="store_true",
+                        help="download and restore the entire backup (see --dest)")
     parser.add_argument("--dest", metavar="DIR", type=Path,
                         default=Path("~/Downloads/BackupOrganizer-Restore"),
                         help="destination for --restore (default: %(default)s)")
@@ -1239,6 +1282,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_browse(cfg, Path(args.browse) if args.browse else None)
     if args.advice:
         return cmd_advice(cfg, args.advice)
+    if args.restore_all:
+        return cmd_restore(cfg, "*", args.dest)
     if args.restore:
         return cmd_restore(cfg, args.restore, args.dest)
 
