@@ -990,6 +990,173 @@ def cmd_restore(cfg: Config, pattern: str, dest: Path) -> int:
     return 0
 
 
+def build_tree(files: dict[str, dict]) -> dict:
+    """Fold manifest arcnames into a nested tree with aggregated sizes.
+
+    Node shape: {"dirs": {name: node}, "files": [(name, entry)], "size", "count"}
+    """
+    root = {"dirs": {}, "files": [], "size": 0, "count": 0}
+    for arc in sorted(files):
+        entry = files[arc]
+        parts = arc.split("/")
+        node = root
+        node["size"] += entry["size"]
+        node["count"] += 1
+        for part in parts[:-1]:
+            node = node["dirs"].setdefault(
+                part, {"dirs": {}, "files": [], "size": 0, "count": 0}
+            )
+            node["size"] += entry["size"]
+            node["count"] += 1
+        node["files"].append((parts[-1], entry))
+    return root
+
+
+def cmd_tree(cfg: Config, prefix: str) -> int:
+    manifest = Manifest.load(cfg.manifest_path)
+    files = {
+        arc: e for arc, e in manifest.files.items()
+        if not prefix or arc.lower().startswith(prefix.lower())
+    }
+    if not files:
+        print("Nothing backed up" + (f" under {prefix!r}." if prefix else " yet."))
+        return 1
+    root = build_tree(files)
+
+    def render(node: dict, indent: str) -> None:
+        dirs = sorted(node["dirs"].items())
+        entries: list[tuple[str, str]] = [
+            (f"{name}/", f"[{human_size(sub['size'])}, {sub['count']} file(s)]")
+            for name, sub in dirs
+        ] + [
+            (name, f"({human_size(e['size'])}, {e['chunk']})")
+            for name, e in node["files"]
+        ]
+        for i, (label, info) in enumerate(entries):
+            last = i == len(entries) - 1
+            print(f"{indent}{'└── ' if last else '├── '}{label}  {info}")
+            if label.endswith("/"):
+                render(node["dirs"][label[:-1]], indent + ("    " if last else "│   "))
+
+    print(f".  [{human_size(root['size'])}, {root['count']} file(s)]")
+    render(root, "")
+    return 0
+
+
+BROWSER_HTML = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BackupOrganizer — __TITLE__</title>
+<style>
+  :root { color-scheme: light dark;
+    --fg: #1d1d1f; --muted: #6e6e73; --bg: #ffffff; --hover: #0000000d;
+    --sync: #0a84ff22; --sync-fg: #0060c0; --arch: #30d15822; --arch-fg: #1a7a35;
+    --pending: #ff9f0a22; --pending-fg: #b06000; }
+  @media (prefers-color-scheme: dark) { :root {
+    --fg: #f5f5f7; --muted: #98989d; --bg: #1c1c1e; --hover: #ffffff14;
+    --sync-fg: #64b5ff; --arch-fg: #5fdb7d; --pending-fg: #ffb340; } }
+  body { font: 14px/1.5 -apple-system, BlinkMacSystemFont, sans-serif;
+         color: var(--fg); background: var(--bg); margin: 0; padding: 1.2em 1.6em 3em; }
+  h1 { font-size: 1.25em; margin: 0 0 .1em; }
+  .meta { color: var(--muted); margin-bottom: 1em; }
+  #q { font: inherit; width: min(28em, 100%); padding: .45em .7em; margin-bottom: 1em;
+       border: 1px solid var(--muted); border-radius: 8px; background: transparent; color: var(--fg); }
+  details { padding-left: 1.1em; }
+  summary { cursor: pointer; border-radius: 6px; padding: .1em .3em; list-style-position: outside; }
+  summary:hover, .file:hover { background: var(--hover); }
+  .file { padding: .1em .3em .1em 2.15em; border-radius: 6px; }
+  .sz { color: var(--muted); font-variant-numeric: tabular-nums; margin-left: .6em; }
+  .badge { font-size: .78em; border-radius: 5px; padding: .08em .45em; margin-left: .6em;
+           font-variant-numeric: tabular-nums; }
+  .b-sync { background: var(--sync); color: var(--sync-fg); }
+  .b-arch { background: var(--arch); color: var(--arch-fg); }
+  .b-pend { background: var(--pending); color: var(--pending-fg); }
+  .hide { display: none; }
+  .dim { color: var(--muted); }
+</style></head><body>
+<h1>Backup contents</h1>
+<div class="meta">__META__</div>
+<input id="q" type="search" placeholder="Search files… (name or path)" autofocus>
+<div id="tree"></div>
+<script>
+const FILES = __DATA__;   // [path, size, chunk, uploaded, source]
+const human = n => { for (const u of ["B","KB","MB","GB","TB"]) {
+  if (n < 1024 || u === "TB") return u === "B" ? n + " B" : n.toFixed(1) + " " + u; n /= 1024; } };
+
+const root = { dirs: new Map(), files: [], size: 0 };
+for (const f of FILES) {
+  const parts = f[0].split("/");
+  let node = root; node.size += f[1];
+  for (const p of parts.slice(0, -1)) {
+    if (!node.dirs.has(p)) node.dirs.set(p, { dirs: new Map(), files: [], size: 0 });
+    node = node.dirs.get(p); node.size += f[1];
+  }
+  node.files.push(f);
+}
+const fileEls = [];
+function render(node, parent, depth) {
+  for (const [name, sub] of [...node.dirs].sort((a, b) => a[0].localeCompare(b[0]))) {
+    const d = document.createElement("details"); if (depth === 0) d.open = true;
+    const s = document.createElement("summary");
+    s.append("📁 " + name, Object.assign(document.createElement("span"),
+      { className: "sz", textContent: human(sub.size) }));
+    d.append(s); parent.append(d); render(sub, d, depth + 1);
+  }
+  for (const [path, size, chunk, up, src] of node.files) {
+    const el = document.createElement("div"); el.className = "file"; el.dataset.p = path.toLowerCase();
+    const badge = Object.assign(document.createElement("span"), {
+      className: "badge " + (up ? (src === "sync" ? "b-sync" : "b-arch") : "b-pend"),
+      textContent: chunk + (up ? "" : " · not uploaded"),
+      title: up ? "Uploaded " + up : "Awaiting upload" });
+    el.append("📄 " + path.split("/").pop(),
+      Object.assign(document.createElement("span"), { className: "sz", textContent: human(size) }), badge);
+    parent.append(el); fileEls.push(el);
+  }
+}
+render(root, document.getElementById("tree"), 0);
+document.getElementById("q").addEventListener("input", e => {
+  const q = e.target.value.trim().toLowerCase();
+  for (const el of fileEls) el.classList.toggle("hide", q !== "" && !el.dataset.p.includes(q));
+  for (const d of document.querySelectorAll("details")) {
+    const any = [...d.querySelectorAll(".file")].some(f => !f.classList.contains("hide"));
+    d.classList.toggle("hide", !any);
+    if (q !== "" && any) d.open = true;
+  }
+});
+</script></body></html>
+"""
+
+
+def cmd_browse(cfg: Config, out: Path | None) -> int:
+    manifest = Manifest.load(cfg.manifest_path)
+    if not manifest.files:
+        print("Nothing backed up yet.")
+        return 1
+    data = [
+        [arc, e["size"], e.get("chunk", "?"),
+         manifest.chunks.get(e.get("chunk", ""), {}).get("uploaded", ""), e["source"]]
+        for arc, e in sorted(manifest.files.items())
+    ]
+    total = sum(e["size"] for e in manifest.files.values())
+    meta = (
+        f"{len(manifest.files)} files · {human_size(total)} · "
+        f"{len(manifest.chunks)} chunks on {cfg.remote_folder} · "
+        f"last backup {manifest.last_backup or 'never'}"
+    )
+    html = (
+        BROWSER_HTML
+        .replace("__TITLE__", cfg.remote_folder)
+        .replace("__META__", meta)
+        .replace("__DATA__", json.dumps(data, ensure_ascii=True).replace("</", "<\\/"))
+    )
+    out = (out or cfg.backup_dir / "backup_browser.html").expanduser()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(html)
+    print(f"Wrote {out} ({human_size(out.stat().st_size)})")
+    subprocess.run(["/usr/bin/open", str(out)], capture_output=True)
+    return 0
+
+
 def cmd_init(config_path: Path) -> int:
     if config_path.exists():
         print(f"Config already exists: {config_path}")
@@ -1036,6 +1203,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--status", action="store_true", help="print backup summary and exit")
     parser.add_argument("--advice", metavar="DIR", type=Path,
                         help="report files in DIR that are safely backed up")
+    parser.add_argument("--tree", metavar="PREFIX", nargs="?", const="",
+                        help="print the backed-up file tree (optionally under PREFIX)")
+    parser.add_argument("--browse", metavar="OUT", nargs="?", const="", type=str,
+                        help="generate an interactive HTML browser of the backup and open it")
     parser.add_argument("--restore", metavar="NAME",
                         help="restore file(s) matching a name, substring or glob")
     parser.add_argument("--dest", metavar="DIR", type=Path,
@@ -1062,6 +1233,10 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.status:
         return cmd_status(cfg)
+    if args.tree is not None:
+        return cmd_tree(cfg, args.tree)
+    if args.browse is not None:
+        return cmd_browse(cfg, Path(args.browse) if args.browse else None)
     if args.advice:
         return cmd_advice(cfg, args.advice)
     if args.restore:

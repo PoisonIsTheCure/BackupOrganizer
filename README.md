@@ -20,6 +20,10 @@ the one chunk that contains it.
   confirmed is the original moved to the Trash.
 - **Single-file restore** — `--restore invoice.pdf` finds the file in the
   manifest, downloads just its chunk, extracts and hash-verifies it.
+- **Backup browser** — `--browse` renders the whole backup as an interactive
+  HTML page (collapsible folders, live search, sizes, chunk badges) built
+  purely from the manifest — browsing costs zero downloads. `--tree` prints
+  the same structure in the terminal.
 - **Manifest state tracking** — `manifest.json` records the path, size, mtime,
   SHA-256 and chunk of every file. Diffing is I/O-efficient: unchanged files
   cost one `stat()` call, zero reads.
@@ -68,6 +72,8 @@ and upload pipeline works.
 | *(none)* | Run a backup: build changed chunks, upload, free local space |
 | `--status` | Print file/chunk counts, sizes, pending uploads, last backup/upload |
 | `--advice DIR` | Report which files in `DIR` are safely backed up |
+| `--tree [PREFIX]` | Print the backed-up file tree, optionally under a path prefix |
+| `--browse [OUT]` | Generate an interactive HTML backup browser and open it |
 | `--restore NAME` | Restore file(s) matching a name/substring/glob (see `--dest`) |
 | `--dest DIR` | Destination for `--restore` (default: `~/Downloads/BackupOrganizer-Restore`) |
 | `--init` | Write a default `config.json` and create the dropzone |
@@ -98,7 +104,8 @@ osacompile -o "Backup Status.app" "Backup Status.applescript"
 ```
 
 Double-clicking **Backup Status.app** shows the `--status` report in a native
-macOS dialog. Keep it in the project folder or drag it to your Desktop/Dock.
+macOS dialog; its **Browse Files** button opens the interactive HTML backup
+browser. Keep the app in the project folder or drag it to your Desktop/Dock.
 
 ## Daily background runs with launchd
 
