@@ -4,7 +4,7 @@
 
 The backup is not one monolithic zip but a set of size-capped **chunks**
 (default 500 MB), each an ordinary zip file, all living remotely under
-`remote_folder` (e.g. `/Backups/MacBookAir/`) next to `manifest.json`.
+`remote_folder` (e.g. `/my-files/Backups/MacBookAir/`) next to `manifest.json`.
 Local chunk files are deleted as soon as their upload is confirmed — freeing
 disk space is the point — so Proton Drive is the primary store, not a mirror.
 

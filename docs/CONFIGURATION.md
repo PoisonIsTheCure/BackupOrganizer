@@ -11,7 +11,7 @@ default. Paths may use `~`.
   "backup_dir": "~/Backups/BackupOrganizer",
   "manifest": "~/Backups/BackupOrganizer/manifest.json",
   "proton_cli": "/Users/alyz/developement/generalBin/proton-drive",
-  "remote_folder": "/Backups/MacBookAir",
+  "remote_folder": "/my-files/Backups/MacBookAir",
   "chunk_mb": 500,
   "keep_local_chunks": false,
   "min_free_gb": 2,
@@ -26,7 +26,7 @@ default. Paths may use `~`.
 | `backup_dir` | Working directory: chunks being built/awaiting upload, logs, lock file. |
 | `manifest` | Path of `manifest.json`. |
 | `proton_cli` | Absolute path to the Proton Drive CLI binary. |
-| `remote_folder` | Proton Drive folder receiving the chunks + manifest (the full path is created on first run). |
+| `remote_folder` | Proton Drive folder receiving the chunks + manifest (the full path is created on first run). Proton paths must live inside a namespace root such as `/my-files`; a path without one (e.g. `/Backups/Mac`) is automatically anchored as `/my-files/Backups/Mac`. |
 | `chunk_mb` | Target chunk size in MB. Files are first-fit packed up to this cap; a **file larger than the cap gets its own dedicated chunk** — it is never split. Bigger chunks = fewer remote files but more data to re-upload per change and to download per restore. |
 | `keep_local_chunks` | `false` (default): local chunk zips are deleted once uploaded — Proton Drive is the only copy and disk space is freed. `true`: keep local copies too (uses disk, but restores never download). |
 | `min_free_gb` | Safety margin: a backup aborts (with a notification) if building its chunks would leave less than this much free disk space. |

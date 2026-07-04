@@ -147,7 +147,7 @@ backup_organizer.log   rotating log
 launchd.log            stdout/stderr of scheduled runs
 ```
 
-On Proton Drive, everything sits in one folder (default `/Backups/MacBookAir`):
+On Proton Drive, everything sits in one folder (default `/my-files/Backups/MacBookAir`):
 
 ```
 sync-00001.zip         chunks of the sync directories
