@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """BackupOrganizer — macOS backup manager and smart storage advisor.
 
-Compresses configured "Sync" directories into a single timestamped zip,
-archives files dropped into a Dropzone (hash-verified, then moved to Trash),
-tracks state in a SHA-256 manifest, advises which local files are safely
-deletable, and uploads the archive to Proton Drive.
+Compresses configured "Sync" directories and an "Archive Dropzone" into
+size-capped zip chunks, uploads them to Proton Drive, and then removes the
+local chunks to free disk space. State lives in a SHA-256 manifest; changed
+files only ever rebuild and re-upload their own chunk, and restoring a file
+only downloads the one chunk that contains it.
 
 Headless by design: run it from launchd for daily backups, or interactively
-with --status / --advice. Requires only the Python standard library.
+with --status / --advice / --restore. Requires only the standard library.
 """
 
 from __future__ import annotations
@@ -31,14 +32,23 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 APP_NAME = "BackupOrganizer"
-MANIFEST_VERSION = 1
+MANIFEST_VERSION = 2
 DEFAULT_CONFIG_PATH = Path("~/Backups/BackupOrganizer/config.json").expanduser()
-ZIP_BIN = "/usr/bin/zip"
 OSASCRIPT_BIN = "/usr/bin/osascript"
 # Files newer than this many seconds are skipped in the dropzone so we never
 # archive a copy that is still being written.
 DROPZONE_SETTLE_SECONDS = 30
-SUBPROCESS_TIMEOUT = 30 * 60  # uploads of large archives can be slow
+SUBPROCESS_TIMEOUT = 15 * 60
+TRANSFER_TIMEOUT = 6 * 60 * 60  # multi-GB chunks on a slow uplink take a while
+
+# Already-compressed formats are stored, not deflated: recompressing a video
+# burns minutes of CPU for well under 1% size gain.
+STORED_SUFFIXES = {
+    ".mp4", ".m4v", ".mov", ".avi", ".mkv", ".webm",
+    ".mp3", ".m4a", ".aac", ".flac", ".ogg",
+    ".jpg", ".jpeg", ".png", ".gif", ".heic", ".heif", ".webp",
+    ".zip", ".gz", ".bz2", ".xz", ".7z", ".rar", ".dmg",
+}
 
 QUOTA_ERROR_RE = re.compile(r"quota|storage.*(full|exceed)|insufficient|not enough space", re.I)
 AUTH_ERROR_RE = re.compile(r"auth|login|session|unauthoriz|forbidden|credential|401|403", re.I)
@@ -56,10 +66,10 @@ DEFAULT_CONFIG = {
     "backup_dir": "~/Backups/BackupOrganizer",
     "manifest": "~/Backups/BackupOrganizer/manifest.json",
     "proton_cli": "/Users/alyz/developement/generalBin/proton-drive",
-    "remote_folder": "/Backups",
-    "remote_keep": 1,
+    "remote_folder": "/Backups/MacBookAir",
+    "chunk_mb": 500,
+    "keep_local_chunks": False,
     "min_free_gb": 2,
-    "max_zip_gb": 0,
     "exclude": [".DS_Store", "*.tmp", "._*", ".localized"],
 }
 
@@ -76,10 +86,14 @@ class Config:
     manifest_path: Path
     proton_cli: str
     remote_folder: str
-    remote_keep: int
+    chunk_mb: float
+    keep_local_chunks: bool
     min_free_gb: float
-    max_zip_gb: float
     exclude: list[str]
+
+    @property
+    def chunk_cap(self) -> int:
+        return max(1, int(self.chunk_mb * 1024**2))
 
     @classmethod
     def load(cls, path: Path) -> "Config":
@@ -98,10 +112,10 @@ class Config:
             backup_dir=Path(raw["backup_dir"]).expanduser(),
             manifest_path=Path(raw["manifest"]).expanduser(),
             proton_cli=str(raw["proton_cli"]),
-            remote_folder=str(raw["remote_folder"]).rstrip("/") or "/",
-            remote_keep=max(1, int(raw["remote_keep"])),
+            remote_folder="/" + str(raw["remote_folder"]).strip("/"),
+            chunk_mb=float(raw["chunk_mb"]),
+            keep_local_chunks=bool(raw["keep_local_chunks"]),
             min_free_gb=float(raw["min_free_gb"]),
-            max_zip_gb=float(raw["max_zip_gb"]),
             exclude=list(raw["exclude"]),
         )
         cfg.validate()
@@ -125,13 +139,23 @@ class Config:
     def is_excluded(self, name: str) -> bool:
         return any(fnmatch.fnmatch(name, pat) for pat in self.exclude)
 
+    def chunk_path(self, name: str) -> Path:
+        return self.backup_dir / name
+
+    def remote_path(self, name: str) -> str:
+        return f"{self.remote_folder}/{name}"
+
 
 @dataclass
 class Manifest:
+    """State file. `files` maps arcname -> file entry, `chunks` maps chunk
+    zip name -> chunk entry; a file entry's `chunk` key names its chunk."""
+
     path: Path
-    zip_name: str = ""
     last_backup: str = ""
     last_upload: str = ""
+    next_chunk: int = 1
+    chunks: dict[str, dict] = field(default_factory=dict)
     files: dict[str, dict] = field(default_factory=dict)
 
     @classmethod
@@ -139,28 +163,43 @@ class Manifest:
         if not path.is_file():
             return cls(path=path)
         data = json.loads(path.read_text())
+        version = data.get("version", 1)
+        if version != MANIFEST_VERSION:
+            # v1 tracked one monolithic zip; that zip stays on disk untouched,
+            # so nothing is lost by starting a fresh v2 state.
+            backup = path.with_suffix(f".v{version}.bak.json")
+            shutil.copy2(path, backup)
+            log.warning(
+                "Manifest version %s is not supported by the chunked format; "
+                "starting fresh. Old manifest kept at %s", version, backup,
+            )
+            return cls(path=path)
         return cls(
             path=path,
-            zip_name=data.get("zip_name", ""),
             last_backup=data.get("last_backup", ""),
             last_upload=data.get("last_upload", ""),
+            next_chunk=data.get("next_chunk", 1),
+            chunks=data.get("chunks", {}),
             files=data.get("files", {}),
         )
 
     def save(self) -> None:
         payload = {
             "version": MANIFEST_VERSION,
-            "zip_name": self.zip_name,
             "last_backup": self.last_backup,
             "last_upload": self.last_upload,
+            "next_chunk": self.next_chunk,
+            "chunks": self.chunks,
             "files": self.files,
         }
         tmp = self.path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(payload, indent=2, sort_keys=True))
         os.replace(tmp, self.path)
 
-    def zip_path(self, cfg: Config) -> Path | None:
-        return cfg.backup_dir / self.zip_name if self.zip_name else None
+    def new_chunk_name(self, kind: str) -> str:
+        name = f"{'sync' if kind == 'sync' else 'arch'}-{self.next_chunk:05d}.zip"
+        self.next_chunk += 1
+        return name
 
 
 # --------------------------------------------------------------------------- #
@@ -169,10 +208,6 @@ class Manifest:
 
 def now_iso() -> str:
     return datetime.datetime.now().astimezone().isoformat(timespec="seconds")
-
-
-def new_zip_name() -> str:
-    return datetime.datetime.now().strftime("backup_%Y%m%d_%H%M%S.zip")
 
 
 def human_size(n: float) -> str:
@@ -228,11 +263,6 @@ def move_to_trash(path: Path) -> bool:
     return True
 
 
-def escape_zip_pattern(arcname: str) -> str:
-    """`zip -d` treats its arguments as glob patterns; escape the wildcards."""
-    return re.sub(r"([*?\[\]])", r"\\\1", arcname)
-
-
 class BackupError(Exception):
     """A fatal, already-logged error; the message is user-facing."""
 
@@ -242,13 +272,23 @@ class BackupError(Exception):
 # --------------------------------------------------------------------------- #
 
 @dataclass
-class PendingFile:
+class Member:
+    """One file destined for (or already inside) a chunk."""
     arcname: str
     origin: Path
     size: int
     mtime_ns: int
-    sha256: str = ""  # filled lazily, only when needed
+    sha256: str = ""
     source: str = "sync"
+
+    @classmethod
+    def from_entry(cls, arcname: str, entry: dict) -> "Member":
+        return cls(arcname, Path(entry["origin"]), entry["size"],
+                   entry["mtime_ns"], entry["sha256"], entry["source"])
+
+    def to_entry(self, chunk: str) -> dict:
+        return {"size": self.size, "mtime_ns": self.mtime_ns, "sha256": self.sha256,
+                "source": self.source, "origin": str(self.origin), "chunk": chunk}
 
 
 def walk_files(root: Path, cfg: Config) -> list[Path]:
@@ -269,10 +309,10 @@ def walk_files(root: Path, cfg: Config) -> list[Path]:
 
 @dataclass
 class SyncDiff:
-    added: list[PendingFile] = field(default_factory=list)
-    changed: list[PendingFile] = field(default_factory=list)
+    added: list[Member] = field(default_factory=list)
+    changed: list[Member] = field(default_factory=list)
     deleted: list[str] = field(default_factory=list)  # arcnames
-    touched: list[PendingFile] = field(default_factory=list)  # stat changed, hash identical
+    touched: list[Member] = field(default_factory=list)  # stat changed, hash identical
 
 
 def diff_sync_dirs(cfg: Config, manifest: Manifest) -> SyncDiff:
@@ -296,14 +336,14 @@ def diff_sync_dirs(cfg: Config, manifest: Manifest) -> SyncDiff:
             entry = manifest.files.get(arcname)
             if entry and entry["size"] == st.st_size and entry["mtime_ns"] == st.st_mtime_ns:
                 continue  # fast path: unchanged
-            pf = PendingFile(arcname, path, st.st_size, st.st_mtime_ns)
-            pf.sha256 = sha256_file(path)
+            m = Member(arcname, path, st.st_size, st.st_mtime_ns)
+            m.sha256 = sha256_file(path)
             if entry is None:
-                diff.added.append(pf)
-            elif entry["sha256"] == pf.sha256:
-                diff.touched.append(pf)  # metadata refresh only, no zip write
+                diff.added.append(m)
+            elif entry["sha256"] == m.sha256:
+                diff.touched.append(m)  # metadata refresh only, no chunk rebuild
             else:
-                diff.changed.append(pf)
+                diff.changed.append(m)
 
     active_prefixes = tuple(f"Sync/{d.name}/" for d in cfg.sync_dirs if d.is_dir())
     diff.deleted = [
@@ -316,14 +356,14 @@ def diff_sync_dirs(cfg: Config, manifest: Manifest) -> SyncDiff:
     return diff
 
 
-def scan_dropzone(cfg: Config, manifest: Manifest) -> tuple[list[PendingFile], dict[Path, list[str]]]:
+def scan_dropzone(cfg: Config, manifest: Manifest) -> tuple[list[Member], dict[Path, list[str]]]:
     """Collect dropzone files ready for archiving.
 
-    Returns the pending files plus a map of top-level dropzone entries to the
+    Returns the members plus a map of top-level dropzone entries to the
     arcnames they contain, so an entry is only trashed once every file in it
-    has been verified inside the zip.
+    is confirmed uploaded.
     """
-    pending: list[PendingFile] = []
+    pending: list[Member] = []
     groups: dict[Path, list[str]] = {}
     if not cfg.dropzone.is_dir():
         return pending, groups
@@ -346,6 +386,13 @@ def scan_dropzone(cfg: Config, manifest: Manifest) -> tuple[list[PendingFile], d
             digest = sha256_file(path)
             arcname = "Archive/" + path.relative_to(cfg.dropzone).as_posix()
             prior = manifest.files.get(arcname)
+            if prior and prior["sha256"] == digest:
+                chunk = manifest.chunks.get(prior.get("chunk", ""))
+                if chunk and (chunk["uploaded"] or cfg.chunk_path(prior["chunk"]).is_file()):
+                    # Identical content is already in a chunk (uploaded, or
+                    # built and awaiting upload): don't archive it again.
+                    group.append(arcname)
+                    continue
             if prior and prior["sha256"] != digest:
                 # Same name, different content: keep both by timestamping the new one.
                 stem, dot, ext = arcname.rpartition(".")
@@ -354,16 +401,81 @@ def scan_dropzone(cfg: Config, manifest: Manifest) -> tuple[list[PendingFile], d
                 while arcname in existing_names:
                     arcname += "_1"
             existing_names.add(arcname)
-            pf = PendingFile(arcname, path, st.st_size, st.st_mtime_ns, digest, source="dropzone")
-            pending.append(pf)
+            pending.append(Member(arcname, path, st.st_size, st.st_mtime_ns,
+                                  digest, source="dropzone"))
             group.append(arcname)
         groups[top] = group
     return pending, groups
 
 
 # --------------------------------------------------------------------------- #
-# Zip operations
+# Chunk planning & building
 # --------------------------------------------------------------------------- #
+
+@dataclass
+class ChunkPlan:
+    name: str
+    kind: str  # "sync" | "archive"
+    members: list[Member]
+
+    @property
+    def total_bytes(self) -> int:
+        return sum(m.size for m in self.members)
+
+
+def pack_new_members(members: list[Member], kind: str, cfg: Config,
+                     manifest: Manifest) -> list[ChunkPlan]:
+    """First-fit pack new files into chunks of at most chunk_cap bytes.
+
+    A file larger than the cap is never split: it gets a dedicated chunk of
+    its own (one zip, one file), so a 4 GB video is one self-contained chunk.
+    """
+    plans: list[ChunkPlan] = []
+    current: list[Member] = []
+    current_bytes = 0
+    for m in sorted(members, key=lambda m: m.arcname):
+        if m.size >= cfg.chunk_cap:
+            plans.append(ChunkPlan(manifest.new_chunk_name(kind), kind, [m]))
+            continue
+        if current and current_bytes + m.size > cfg.chunk_cap:
+            plans.append(ChunkPlan(manifest.new_chunk_name(kind), kind, current))
+            current, current_bytes = [], 0
+        current.append(m)
+        current_bytes += m.size
+    if current:
+        plans.append(ChunkPlan(manifest.new_chunk_name(kind), kind, current))
+    return plans
+
+
+def plan_rebuilds(cfg: Config, manifest: Manifest, diff: SyncDiff) -> tuple[list[ChunkPlan], list[str]]:
+    """Plan rebuilds for sync chunks with a changed or deleted member.
+
+    Sync chunks are rebuilt entirely from the live local files, so updating a
+    chunk never requires downloading anything. Returns (rebuild plans, chunks
+    that end up empty and must be removed).
+    """
+    dirty: set[str] = set()
+    for arc in diff.deleted:
+        dirty.add(manifest.files[arc]["chunk"])
+    changed_by_arc = {m.arcname: m for m in diff.changed}
+    for m in diff.changed:
+        dirty.add(manifest.files[m.arcname]["chunk"])
+
+    plans: list[ChunkPlan] = []
+    empty: list[str] = []
+    deleted = set(diff.deleted)
+    for chunk_name in sorted(dirty):
+        members = [
+            changed_by_arc.get(arc) or Member.from_entry(arc, entry)
+            for arc, entry in manifest.files.items()
+            if entry.get("chunk") == chunk_name and arc not in deleted
+        ]
+        if members:
+            plans.append(ChunkPlan(chunk_name, "sync", members))
+        else:
+            empty.append(chunk_name)
+    return plans, empty
+
 
 def check_free_space(cfg: Config, needed_bytes: int) -> None:
     margin = int(cfg.min_free_gb * 1024**3)
@@ -375,66 +487,74 @@ def check_free_space(cfg: Config, needed_bytes: int) -> None:
         )
 
 
-def build_zip(zip_path: Path, files: list[PendingFile]) -> None:
-    """Create a fresh archive from scratch (first run / recovery)."""
-    tmp = zip_path.with_suffix(".zip.tmp")
+def build_chunk(cfg: Config, plan: ChunkPlan) -> dict:
+    """Write one chunk zip and return its manifest entry.
+
+    Already-compressed formats are stored rather than deflated, and every
+    archive-chunk member is streamed back out of the finished zip and
+    hash-verified before the chunk is accepted.
+    """
+    path = cfg.chunk_path(plan.name)
+    tmp = path.with_suffix(".zip.tmp")
     with zipfile.ZipFile(tmp, "w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for pf in files:
-            zf.write(pf.origin, pf.arcname)
-    os.replace(tmp, zip_path)
-
-
-def update_zip(zip_path: Path, to_write: list[PendingFile], to_delete: list[str]) -> None:
-    """Update an existing archive in place, touching only changed entries.
-
-    Added/changed files are staged as symlinks in a temp tree that mirrors the
-    archive layout, then handed to the system `zip` tool, which recompresses
-    only those entries (it rewrites the archive container, but never re-reads
-    or recompresses unchanged file data). Deletions use `zip -d`.
-    """
-    if to_delete:
-        args = [ZIP_BIN, "-q", "-d", str(zip_path)]
-        args += [escape_zip_pattern(a) for a in to_delete]
-        proc = subprocess.run(args, capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT)
-        if proc.returncode not in (0, 12):  # 12 = nothing matched
-            raise BackupError(f"zip -d failed ({proc.returncode}): {proc.stderr.strip()}")
-
-    if to_write:
-        with tempfile.TemporaryDirectory(dir=zip_path.parent) as staging:
-            for pf in to_write:
-                link = Path(staging) / pf.arcname
-                link.parent.mkdir(parents=True, exist_ok=True)
-                os.symlink(pf.origin, link)
-            # Default add mode replaces existing entries unconditionally
-            # (unlike -u, which trusts mtimes). zip follows symlinks by default.
-            args = [ZIP_BIN, "-q", "-X", str(zip_path)] + [pf.arcname for pf in to_write]
-            proc = subprocess.run(
-                args, cwd=staging, capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT
-            )
-            if proc.returncode != 0:
-                raise BackupError(f"zip update failed ({proc.returncode}): {proc.stderr.strip()}")
-
-
-def verify_zip(zip_path: Path, dropzone_files: list[PendingFile]) -> list[PendingFile]:
-    """CRC-check the archive and hash-verify every dropzone entry.
-
-    Returns the dropzone files whose in-zip content matches their local hash.
-    """
-    verified: list[PendingFile] = []
-    with zipfile.ZipFile(zip_path) as zf:
+        for m in plan.members:
+            method = (zipfile.ZIP_STORED
+                      if Path(m.arcname).suffix.lower() in STORED_SUFFIXES
+                      else zipfile.ZIP_DEFLATED)
+            zf.write(m.origin, m.arcname, compress_type=method)
+    with zipfile.ZipFile(tmp) as zf:
         bad = zf.testzip()
         if bad is not None:
-            raise BackupError(f"Archive integrity check failed at entry: {bad}")
-        for pf in dropzone_files:
-            if sha256_zip_entry(zf, pf.arcname) == pf.sha256:
-                verified.append(pf)
-            else:
-                log.error("Hash mismatch inside zip for %s — local file kept.", pf.arcname)
-    return verified
+            tmp.unlink(missing_ok=True)
+            raise BackupError(f"Chunk {plan.name} failed its CRC check at {bad}.")
+        if plan.kind == "archive":
+            for m in plan.members:
+                if sha256_zip_entry(zf, m.arcname) != m.sha256:
+                    tmp.unlink(missing_ok=True)
+                    raise BackupError(
+                        f"Hash mismatch inside {plan.name} for {m.arcname}; "
+                        "the original was NOT touched."
+                    )
+    os.replace(tmp, path)
+    return {
+        "kind": plan.kind,
+        "size": path.stat().st_size,
+        "sha256": sha256_file(path),
+        "files": len(plan.members),
+        "uploaded": "",
+    }
+
+
+def reconcile_chunks(cfg: Config, manifest: Manifest) -> set[str]:
+    """Handle chunks that were built earlier but vanished before upload.
+
+    Sync chunks are simply rebuilt from the live files; archive chunks are
+    dropped from the manifest — their originals are still in the dropzone
+    (they are only trashed after a confirmed upload), so the next scan
+    re-archives them. Returns sync chunk names needing a rebuild.
+    """
+    rebuild: set[str] = set()
+    for name, meta in list(manifest.chunks.items()):
+        if meta["uploaded"] or cfg.chunk_path(name).is_file():
+            continue
+        if meta["kind"] == "sync":
+            log.warning("Chunk %s disappeared before upload; will rebuild.", name)
+            rebuild.add(name)
+        else:
+            log.warning(
+                "Archive chunk %s disappeared before upload; dropping it — "
+                "its originals are still in the dropzone and will be re-archived.",
+                name,
+            )
+            manifest.files = {
+                arc: e for arc, e in manifest.files.items() if e.get("chunk") != name
+            }
+            del manifest.chunks[name]
+    return rebuild
 
 
 # --------------------------------------------------------------------------- #
-# Proton Drive upload
+# Proton Drive
 # --------------------------------------------------------------------------- #
 
 class UploadError(Exception):
@@ -451,72 +571,130 @@ def classify_upload_error(output: str) -> str:
     return "error"
 
 
-def proton(cfg: Config, *args: str) -> subprocess.CompletedProcess:
+def proton(cfg: Config, *args: str, timeout: int = SUBPROCESS_TIMEOUT) -> subprocess.CompletedProcess:
     return subprocess.run(
-        [cfg.proton_cli, *args], capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT
+        [cfg.proton_cli, *args], capture_output=True, text=True, timeout=timeout
     )
 
 
-def upload_backup(cfg: Config, zip_path: Path, manifest: Manifest) -> None:
-    if cfg.max_zip_gb > 0:
-        size = zip_path.stat().st_size
-        if size > cfg.max_zip_gb * 1024**3:
-            raise UploadError(
-                "quota",
-                f"Archive is {human_size(size)}, over the configured "
-                f"max_zip_gb limit of {cfg.max_zip_gb} GB — upload skipped.",
-            )
-
-    # Ensure the remote folder exists; "already exists" errors are fine.
-    parent = str(Path(cfg.remote_folder).parent).replace("\\", "/") or "/"
-    name = Path(cfg.remote_folder).name
-    if name:
-        proc = proton(cfg, "filesystem", "create-folder", parent, name)
+def ensure_remote_folder(cfg: Config) -> None:
+    """Create each component of remote_folder; 'already exists' is fine."""
+    parts = [p for p in cfg.remote_folder.split("/") if p]
+    parent = "/"
+    for part in parts:
+        proc = proton(cfg, "filesystem", "create-folder", parent, part)
         if proc.returncode != 0 and "exist" not in (proc.stderr + proc.stdout).lower():
-            log.warning("create-folder %s: %s", cfg.remote_folder, proc.stderr.strip())
+            log.debug("create-folder %s/%s: %s", parent.rstrip("/"), part, proc.stderr.strip())
+        parent = parent.rstrip("/") + "/" + part
 
+
+def upload_file(cfg: Config, local: Path) -> None:
     proc = proton(
-        cfg,
-        "filesystem", "upload", "-c", "replace", "-t",
-        str(zip_path), str(manifest.path), cfg.remote_folder,
+        cfg, "filesystem", "upload", "-c", "replace", "-t",
+        str(local), cfg.remote_folder, timeout=TRANSFER_TIMEOUT,
     )
     if proc.returncode != 0:
         output = proc.stderr + proc.stdout
         raise UploadError(classify_upload_error(output), output.strip()[:500] or "unknown error")
 
-    prune_remote(cfg, keep_name=zip_path.name)
 
-
-def prune_remote(cfg: Config, keep_name: str) -> None:
-    """Trash remote backup zips beyond remote_keep. Best effort, never fatal."""
+def confirm_remote(cfg: Config, name: str, expect_size: int) -> bool:
+    """Best-effort check that the uploaded file exists remotely at the right
+    size. Returns False only on a *positive* size mismatch; an unreadable or
+    unparseable response is trusted (the upload already exited 0)."""
     try:
-        proc = proton(cfg, "--json", "filesystem", "list", cfg.remote_folder)
+        proc = proton(cfg, "--json", "filesystem", "info", cfg.remote_path(name))
         if proc.returncode != 0:
-            log.warning("Remote list failed, skipping prune: %s", proc.stderr.strip())
-            return
-        names: list[str] = []
-        for line in proc.stdout.splitlines():
-            line = line.strip()
-            if not line:
+            log.debug("Remote confirm of %s unavailable: %s", name, proc.stderr.strip())
+            return True
+        sizes: list[int] = []
+
+        def collect(node) -> None:
+            if isinstance(node, dict):
+                for k, v in node.items():
+                    if "size" in k.lower() and isinstance(v, int):
+                        sizes.append(v)
+                    collect(v)
+            elif isinstance(node, list):
+                for v in node:
+                    collect(v)
+
+        collect(json.loads(proc.stdout))
+        if sizes and expect_size not in sizes:
+            log.error("Remote size mismatch for %s: local %d, remote %s", name, expect_size, sizes)
+            return False
+        return True
+    except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
+        return True
+
+
+def download_chunk(cfg: Config, name: str, dest_dir: Path) -> Path:
+    proc = proton(
+        cfg, "filesystem", "download", "-c", "replace",
+        cfg.remote_path(name), str(dest_dir), timeout=TRANSFER_TIMEOUT,
+    )
+    local = dest_dir / name
+    if proc.returncode != 0 or not local.is_file():
+        output = (proc.stderr + proc.stdout).strip()[:500]
+        raise UploadError(classify_upload_error(output), f"download of {name} failed: {output}")
+    return local
+
+
+def upload_pending(cfg: Config, manifest: Manifest,
+                   trash_remote: list[str]) -> tuple[int, int, UploadError | None]:
+    """Upload every not-yet-uploaded chunk plus the manifest.
+
+    After each confirmed chunk upload the local zip is deleted (unless
+    keep_local_chunks). Returns (chunks uploaded, local bytes freed, error).
+    """
+    error: UploadError | None = None
+    uploaded = 0
+    freed = 0
+    try:
+        ensure_remote_folder(cfg)
+        for name in sorted(manifest.chunks):
+            meta = manifest.chunks[name]
+            local = cfg.chunk_path(name)
+            if meta["uploaded"] or not local.is_file():
                 continue
-            try:
-                item = json.loads(line)
-                name = item.get("name") or item.get("Name") or ""
-            except json.JSONDecodeError:
-                name = line
-            if re.fullmatch(r"backup_\d{8}_\d{6}\.zip", name):
-                names.append(name)
-        names = sorted(n for n in set(names) if n != keep_name)
-        excess = names[: max(0, len(names) - (cfg.remote_keep - 1))]
-        for name in excess:
-            remote_path = f"{cfg.remote_folder}/{name}"
-            proc = proton(cfg, "filesystem", "trash", remote_path)
-            if proc.returncode == 0:
-                log.info("Trashed old remote backup %s", remote_path)
-            else:
-                log.warning("Could not trash %s: %s", remote_path, proc.stderr.strip())
+            log.info("Uploading %s (%s) ...", name, human_size(meta["size"]))
+            upload_file(cfg, local)
+            if not confirm_remote(cfg, name, meta["size"]):
+                raise UploadError("error", f"remote size mismatch for {name}")
+            meta["uploaded"] = now_iso()
+            uploaded += 1
+            manifest.save()  # persist progress after every chunk
+            if not cfg.keep_local_chunks:
+                freed += meta["size"]
+                local.unlink()
+    except UploadError as exc:
+        error = exc
     except (OSError, subprocess.TimeoutExpired) as exc:
-        log.warning("Remote prune skipped: %s", exc)
+        error = UploadError("error", str(exc))
+
+    if error is None:
+        # Old chunks are only trashed remotely once their replacements are up.
+        for name in trash_remote:
+            proc = proton(cfg, "filesystem", "trash", cfg.remote_path(name))
+            if proc.returncode != 0:
+                log.warning("Could not trash remote %s: %s", name, proc.stderr.strip())
+        try:
+            manifest.save()
+            upload_file(cfg, manifest.path)
+            manifest.last_upload = now_iso()
+        except UploadError as exc:
+            error = exc
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            error = UploadError("error", str(exc))
+    manifest.save()
+    return uploaded, freed, error
+
+
+UPLOAD_FAIL_MESSAGES = {
+    "quota": "Proton Drive storage is FULL — upload failed. Free up space in your plan.",
+    "auth": "Proton Drive login expired — run `proton-drive auth login`.",
+    "error": "Proton Drive upload failed (network/CLI error). Data is kept locally.",
+}
 
 
 # --------------------------------------------------------------------------- #
@@ -525,169 +703,128 @@ def prune_remote(cfg: Config, keep_name: str) -> None:
 
 def cmd_backup(cfg: Config, do_upload: bool, dry_run: bool, notify_enabled: bool) -> int:
     manifest = Manifest.load(cfg.manifest_path)
-    zip_path = manifest.zip_path(cfg)
-
-    if zip_path and not zip_path.is_file():
-        lost = [a for a, e in manifest.files.items() if e.get("source") == "dropzone"]
-        log.error(
-            "Archive %s is missing from disk; rebuilding. %d archived dropzone "
-            "entr%s no longer backed up: %s",
-            zip_path, len(lost), "y is" if len(lost) == 1 else "ies are",
-            ", ".join(lost) or "none",
-        )
-        if lost:
-            notify(
-                APP_NAME,
-                f"Backup zip was missing — rebuilt, but {len(lost)} archived "
-                "file(s) were lost with it. See the log.",
-                notify_enabled,
-            )
-        manifest = Manifest(path=cfg.manifest_path)
-        zip_path = None
+    forced_rebuilds = reconcile_chunks(cfg, manifest)
 
     diff = diff_sync_dirs(cfg, manifest)
-    dropzone_files, dropzone_groups = scan_dropzone(cfg, manifest)
+    dropzone_members, dropzone_groups = scan_dropzone(cfg, manifest)
 
-    to_write = diff.added + diff.changed + dropzone_files
-    n_changes = len(to_write) + len(diff.deleted)
+    rebuild_plans, emptied_chunks = plan_rebuilds(cfg, manifest, diff)
+    planned = {p.name for p in rebuild_plans}
+    for name in forced_rebuilds - planned:
+        members = [Member.from_entry(arc, e) for arc, e in manifest.files.items()
+                   if e.get("chunk") == name]
+        if members:
+            rebuild_plans.append(ChunkPlan(name, "sync", members))
+    new_sync_plans = pack_new_members(diff.added, "sync", cfg, manifest)
+    new_arch_plans = pack_new_members(dropzone_members, "archive", cfg, manifest)
+    all_plans = rebuild_plans + new_sync_plans + new_arch_plans
+
     log.info(
-        "Diff: %d added, %d changed, %d deleted, %d touched, %d dropzone file(s).",
-        len(diff.added), len(diff.changed), len(diff.deleted),
-        len(diff.touched), len(dropzone_files),
+        "Diff: %d added, %d changed, %d deleted, %d touched, %d dropzone file(s) "
+        "-> %d chunk build(s), %d chunk removal(s).",
+        len(diff.added), len(diff.changed), len(diff.deleted), len(diff.touched),
+        len(dropzone_members), len(all_plans), len(emptied_chunks),
     )
 
     if dry_run:
         for label, items in (
-            ("ADD", [pf.arcname for pf in diff.added]),
-            ("UPDATE", [pf.arcname for pf in diff.changed]),
+            ("ADD", [m.arcname for m in diff.added]),
+            ("UPDATE", [m.arcname for m in diff.changed]),
             ("DELETE", diff.deleted),
-            ("ARCHIVE", [pf.arcname for pf in dropzone_files]),
+            ("ARCHIVE", [m.arcname for m in dropzone_members]),
         ):
             for arc in items:
                 print(f"{label:8} {arc}")
-        print(f"\n{n_changes} change(s) would be written. Nothing was modified.")
+        for plan in all_plans:
+            print(f"CHUNK    {plan.name} ({plan.kind}, {len(plan.members)} file(s), "
+                  f"{human_size(plan.total_bytes)})")
+        for name in emptied_chunks:
+            print(f"REMOVE   {name} (no members left)")
+        print("\nNothing was modified.")
         return 0
 
-    if n_changes == 0 and not diff.touched:
-        log.info("Everything up to date; no zip write needed.")
-        manifest.last_backup = now_iso()
-        if zip_path:
-            manifest.save()
-        if do_upload and manifest.zip_name and not manifest.last_upload:
-            _try_upload(cfg, manifest, notify_enabled)
-        notify(APP_NAME, "Backup OK — no changes.", notify_enabled)
-        return 0
-
-    # ----- write the archive -------------------------------------------- #
-    if n_changes:
-        delta = sum(pf.size for pf in to_write)
-        current = zip_path.stat().st_size if zip_path else 0
-        # `zip` rewrites the container to a temp copy next to the archive, so
-        # the worst case needs room for the old archive plus the new data.
-        check_free_space(cfg, current + delta)
-
-        if zip_path is None:
-            manifest.zip_name = new_zip_name()
-            zip_path = manifest.zip_path(cfg)
-            assert zip_path is not None
-            build_zip(zip_path, to_write)
-        else:
-            update_zip(zip_path, to_write, diff.deleted)
-
-        verified = verify_zip(zip_path, dropzone_files)
-        verified_set = {pf.arcname for pf in verified}
-
-        # Rotate the filename so it always names the latest successful backup.
-        fresh = cfg.backup_dir / new_zip_name()
-        if fresh != zip_path:
-            os.rename(zip_path, fresh)
-            zip_path = fresh
-            manifest.zip_name = fresh.name
-    else:
-        verified_set = set()
+    # ----- build chunks --------------------------------------------------- #
+    if all_plans:
+        check_free_space(cfg, sum(p.total_bytes for p in all_plans))
+        for plan in all_plans:
+            log.info("Building %s (%d file(s), %s)...",
+                     plan.name, len(plan.members), human_size(plan.total_bytes))
+            manifest.chunks[plan.name] = build_chunk(cfg, plan)
 
     # ----- update manifest ------------------------------------------------ #
     for arc in diff.deleted:
         manifest.files.pop(arc, None)
-    for pf in diff.added + diff.changed + diff.touched:
-        manifest.files[pf.arcname] = {
-            "size": pf.size, "mtime_ns": pf.mtime_ns,
-            "sha256": pf.sha256, "source": "sync", "origin": str(pf.origin),
-        }
-    for pf in dropzone_files:
-        if pf.arcname in verified_set:
-            manifest.files[pf.arcname] = {
-                "size": pf.size, "mtime_ns": pf.mtime_ns,
-                "sha256": pf.sha256, "source": "dropzone", "origin": str(pf.origin),
-            }
+    trash_remote: list[str] = []
+    for name in emptied_chunks:
+        meta = manifest.chunks.pop(name, None)
+        cfg.chunk_path(name).unlink(missing_ok=True)
+        if meta and meta["uploaded"]:
+            trash_remote.append(name)
+    for plan in all_plans:
+        for m in plan.members:
+            manifest.files[m.arcname] = m.to_entry(plan.name)
+    for m in diff.touched:
+        chunk = manifest.files[m.arcname]["chunk"]
+        manifest.files[m.arcname] = m.to_entry(chunk)
     manifest.last_backup = now_iso()
     manifest.save()
 
-    # ----- trash verified dropzone originals ------------------------------ #
+    # ----- upload, then free local space ----------------------------------- #
+    uploaded = freed = 0
+    upload_error: UploadError | None = None
+    pending_upload = any(
+        not meta["uploaded"] and cfg.chunk_path(name).is_file()
+        for name, meta in manifest.chunks.items()
+    )
+    if do_upload and (pending_upload or all_plans or trash_remote or diff.deleted or diff.touched):
+        uploaded, freed, upload_error = upload_pending(cfg, manifest, trash_remote)
+        if upload_error:
+            log.error("Upload failed (%s): %s", upload_error.kind, upload_error)
+
+    # ----- trash dropzone originals whose chunks are confirmed uploaded ---- #
     trashed = 0
-    unverified_groups = 0
+    waiting = 0
     for top, arcnames in dropzone_groups.items():
-        if all(a in verified_set for a in arcnames):
+        fully_uploaded = all(
+            a in manifest.files
+            and manifest.chunks.get(manifest.files[a]["chunk"], {}).get("uploaded")
+            for a in arcnames
+        )
+        if fully_uploaded:
             if move_to_trash(top):
                 trashed += 1
-            log.info("Archived and trashed dropzone entry: %s", top.name)
+                log.info("Uploaded and trashed dropzone entry: %s", top.name)
         else:
-            unverified_groups += 1
-            log.error("Dropzone entry NOT trashed (verification failed): %s", top.name)
+            waiting += 1
+            log.info("Dropzone entry kept until its upload is confirmed: %s", top.name)
 
-    # ----- upload ---------------------------------------------------------- #
-    upload_note = ""
-    if do_upload:
-        upload_note = _try_upload(cfg, manifest, notify_enabled)
-
-    summary = (
-        f"{len(diff.added)} added, {len(diff.changed)} updated, "
-        f"{len(diff.deleted)} removed"
-    )
-    if dropzone_files:
-        summary += f", {trashed} dropzone item(s) archived"
-    if unverified_groups:
-        notify(APP_NAME, f"Backup finished with ERRORS — {unverified_groups} "
-                         "dropzone item(s) failed verification. See the log.", notify_enabled)
+    # ----- report ---------------------------------------------------------- #
+    if upload_error:
+        notify(APP_NAME, UPLOAD_FAIL_MESSAGES[upload_error.kind], notify_enabled)
         return 1
-    notify(APP_NAME, f"Backup OK — {summary}.{upload_note}", notify_enabled)
+    parts = [f"{len(diff.added)} added, {len(diff.changed)} updated, {len(diff.deleted)} removed"]
+    if trashed or waiting:
+        parts.append(f"{trashed} dropzone item(s) offloaded")
+    if uploaded:
+        parts.append(f"{uploaded} chunk(s) uploaded")
+    if freed:
+        parts.append(f"{human_size(freed)} freed locally")
+    notify(APP_NAME, "Backup OK — " + ", ".join(parts) + ".", notify_enabled)
     return 0
-
-
-def _try_upload(cfg: Config, manifest: Manifest, notify_enabled: bool) -> str:
-    """Upload and report. Returns a suffix for the success notification."""
-    zip_path = manifest.zip_path(cfg)
-    if not zip_path or not zip_path.is_file():
-        return ""
-    try:
-        log.info("Uploading %s to Proton Drive %s ...", zip_path.name, cfg.remote_folder)
-        upload_backup(cfg, zip_path, manifest)
-        manifest.last_upload = now_iso()
-        manifest.save()
-        log.info("Upload complete.")
-        return " Uploaded to Proton Drive."
-    except UploadError as exc:
-        log.error("Upload failed (%s): %s", exc.kind, exc)
-        messages = {
-            "quota": "Proton Drive storage is FULL — upload failed. Free up space in your plan.",
-            "auth": "Proton Drive login expired — run `proton-drive auth login`.",
-            "error": "Proton Drive upload failed (network/CLI error). Backup is safe locally.",
-        }
-        notify(APP_NAME, messages[exc.kind], notify_enabled)
-        return " Upload FAILED (will retry next run)."
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        log.error("Upload failed: %s", exc)
-        notify(APP_NAME, "Proton Drive upload failed — see the log.", notify_enabled)
-        return " Upload FAILED (will retry next run)."
 
 
 def cmd_status(cfg: Config) -> int:
     manifest = Manifest.load(cfg.manifest_path)
-    zip_path = manifest.zip_path(cfg)
     total = len(manifest.files)
     total_bytes = sum(e["size"] for e in manifest.files.values())
     sync_n = sum(1 for e in manifest.files.values() if e.get("source") == "sync")
     arch_n = total - sync_n
+    n_chunks = len(manifest.chunks)
+    pending_chunks = [n for n, m in manifest.chunks.items() if not m["uploaded"]]
+    local_bytes = sum(
+        cfg.chunk_path(n).stat().st_size
+        for n in manifest.chunks if cfg.chunk_path(n).is_file()
+    )
     pending = 0
     if cfg.dropzone.is_dir():
         pending = sum(
@@ -697,19 +834,16 @@ def cmd_status(cfg: Config) -> int:
 
     lines = [
         f"{APP_NAME} status",
-        "-" * 34,
-        f"Files backed up:   {total}  ({sync_n} sync, {arch_n} archived)",
-        f"Total size:        {human_size(total_bytes)}",
-        f"Archive:           {manifest.zip_name or '(none yet)'}",
-    ]
-    if zip_path and zip_path.is_file():
-        lines.append(f"Archive size:      {human_size(zip_path.stat().st_size)}")
-    elif manifest.zip_name:
-        lines.append("Archive size:      MISSING FROM DISK!")
-    lines += [
-        f"Last backup:       {manifest.last_backup or 'never'}",
-        f"Last upload:       {manifest.last_upload or 'never'}",
-        f"Dropzone pending:  {pending} item(s)",
+        "-" * 36,
+        f"Files backed up:    {total}  ({sync_n} sync, {arch_n} archived)",
+        f"Total size:         {human_size(total_bytes)}",
+        f"Chunks:             {n_chunks} on {cfg.remote_folder}",
+        f"Awaiting upload:    {len(pending_chunks)} chunk(s)"
+        + (f" ({', '.join(sorted(pending_chunks))})" if pending_chunks else ""),
+        f"Local chunk cache:  {human_size(local_bytes)}",
+        f"Last backup:        {manifest.last_backup or 'never'}",
+        f"Last upload:        {manifest.last_upload or 'never'}",
+        f"Dropzone pending:   {pending} item(s)",
     ]
     print("\n".join(lines))
     return 0
@@ -721,13 +855,17 @@ def cmd_advice(cfg: Config, target: Path) -> int:
         print(f"Not a directory: {target}", file=sys.stderr)
         return 2
     manifest = Manifest.load(cfg.manifest_path)
-    zip_path = manifest.zip_path(cfg)
-    if not manifest.files or not zip_path or not zip_path.is_file():
-        print("No backup archive on disk yet — nothing is safe to delete.")
+    if not manifest.files:
+        print("Nothing has been backed up yet — nothing is safe to delete.")
         return 1
 
-    by_hash = {e["sha256"]: arc for arc, e in manifest.files.items()}
-    by_origin = {e["origin"]: (arc, e) for arc, e in manifest.files.items()}
+    # Only entries whose chunk is confirmed uploaded count as safe: once local
+    # chunks are deleted, Proton Drive is the *only* copy.
+    def is_safe(entry: dict) -> bool:
+        return bool(manifest.chunks.get(entry.get("chunk", ""), {}).get("uploaded"))
+
+    by_hash = {e["sha256"]: arc for arc, e in manifest.files.items() if is_safe(e)}
+    by_origin = {e["origin"]: (arc, e) for arc, e in manifest.files.items() if is_safe(e)}
 
     safe: list[tuple[Path, int, str]] = []
     unsafe: list[Path] = []
@@ -744,10 +882,11 @@ def cmd_advice(cfg: Config, target: Path) -> int:
             unsafe.append(path)
 
     print(f"Safe-to-delete report for: {target}")
-    print(f"(verified against {manifest.zip_name}, last backup {manifest.last_backup})")
+    print(f"(verified against chunks uploaded to {cfg.remote_folder}, "
+          f"last backup {manifest.last_backup})")
     print()
     if safe:
-        print(f"SAFE TO DELETE — {len(safe)} file(s), byte-identical copies exist in the backup:")
+        print(f"SAFE TO DELETE — {len(safe)} file(s), byte-identical copies are uploaded:")
         for path, size, arc in safe:
             print(f"  {path}  [{human_size(size)}]  -> {arc}")
         print(f"\n  Reclaimable: {human_size(sum(s for _, s, _ in safe))}")
@@ -761,6 +900,56 @@ def cmd_advice(cfg: Config, target: Path) -> int:
     else:
         print("NOT BACKED UP: none — everything here is covered.")
     print("\nThis report is advisory only; nothing was deleted.")
+    return 0
+
+
+def cmd_restore(cfg: Config, pattern: str, dest: Path) -> int:
+    """Restore files by name/glob, downloading only the chunks that hold them."""
+    manifest = Manifest.load(cfg.manifest_path)
+    matches = sorted(
+        arc for arc in manifest.files
+        if fnmatch.fnmatchcase(arc, pattern) or pattern.lower() in arc.lower()
+    )
+    if not matches:
+        print(f"No backed-up file matches {pattern!r}. Try --status or a broader pattern.")
+        return 1
+    dest = dest.expanduser()
+    dest.mkdir(parents=True, exist_ok=True)
+
+    by_chunk: dict[str, list[str]] = {}
+    for arc in matches:
+        by_chunk.setdefault(manifest.files[arc]["chunk"], []).append(arc)
+    print(f"Restoring {len(matches)} file(s) from {len(by_chunk)} chunk(s) to {dest}")
+
+    failures = 0
+    with tempfile.TemporaryDirectory(dir=cfg.backup_dir if cfg.backup_dir.is_dir() else None) as tmp:
+        for chunk_name, arcs in sorted(by_chunk.items()):
+            local = cfg.chunk_path(chunk_name)
+            if not local.is_file():
+                print(f"  downloading {chunk_name} "
+                      f"({human_size(manifest.chunks.get(chunk_name, {}).get('size', 0))}) ...")
+                try:
+                    local = download_chunk(cfg, chunk_name, Path(tmp))
+                except UploadError as exc:
+                    print(f"  ERROR: {exc}", file=sys.stderr)
+                    failures += len(arcs)
+                    continue
+            with zipfile.ZipFile(local) as zf:
+                for arc in arcs:
+                    out = dest / arc
+                    out.parent.mkdir(parents=True, exist_ok=True)
+                    with zf.open(arc) as src, open(out, "wb") as dst:
+                        shutil.copyfileobj(src, dst, 1024 * 1024)
+                    if sha256_file(out) == manifest.files[arc]["sha256"]:
+                        print(f"  OK  {arc}")
+                    else:
+                        failures += 1
+                        print(f"  HASH MISMATCH  {arc} (restored file kept for inspection)",
+                              file=sys.stderr)
+    if failures:
+        print(f"\n{failures} file(s) failed to restore.", file=sys.stderr)
+        return 1
+    print("\nAll files restored and hash-verified.")
     return 0
 
 
@@ -810,6 +999,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--status", action="store_true", help="print backup summary and exit")
     parser.add_argument("--advice", metavar="DIR", type=Path,
                         help="report files in DIR that are safely backed up")
+    parser.add_argument("--restore", metavar="NAME",
+                        help="restore file(s) matching a name, substring or glob")
+    parser.add_argument("--dest", metavar="DIR", type=Path,
+                        default=Path("~/Downloads/BackupOrganizer-Restore"),
+                        help="destination for --restore (default: %(default)s)")
     parser.add_argument("--init", action="store_true", help="write a default config and exit")
     parser.add_argument("--no-upload", action="store_true", help="skip the Proton Drive upload")
     parser.add_argument("--dry-run", action="store_true", help="show changes without writing")
@@ -833,6 +1027,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_status(cfg)
     if args.advice:
         return cmd_advice(cfg, args.advice)
+    if args.restore:
+        return cmd_restore(cfg, args.restore, args.dest)
 
     cfg.backup_dir.mkdir(parents=True, exist_ok=True)
     lock_file = open(cfg.backup_dir / ".lock", "w")

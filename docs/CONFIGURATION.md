@@ -11,38 +11,49 @@ default. Paths may use `~`.
   "backup_dir": "~/Backups/BackupOrganizer",
   "manifest": "~/Backups/BackupOrganizer/manifest.json",
   "proton_cli": "/Users/alyz/developement/generalBin/proton-drive",
-  "remote_folder": "/Backups",
-  "remote_keep": 1,
+  "remote_folder": "/Backups/MacBookAir",
+  "chunk_mb": 500,
+  "keep_local_chunks": false,
   "min_free_gb": 2,
-  "max_zip_gb": 0,
   "exclude": [".DS_Store", "*.tmp", "._*", ".localized"]
 }
 ```
 
 | Key | Meaning |
 | --- | --- |
-| `sync_dirs` | Directories mirrored into the archive under `Sync/<basename>/…`. Basenames must be unique (their archive paths would collide otherwise — the tool refuses to start). |
-| `dropzone` | The Archive Dropzone. Anything placed here is archived under `Archive/…`, hash-verified, then moved to the Trash. Must not overlap a sync dir. |
-| `backup_dir` | Where the `backup_<timestamp>.zip`, logs and lock file live. |
+| `sync_dirs` | Directories backed up under `Sync/<basename>/…`. Basenames must be unique (their archive paths would collide otherwise — the tool refuses to start). |
+| `dropzone` | The Archive Dropzone. Anything placed here is packed into archive chunks under `Archive/…`, uploaded, and — only after the upload is confirmed — moved to the Trash. Must not overlap a sync dir. |
+| `backup_dir` | Working directory: chunks being built/awaiting upload, logs, lock file. |
 | `manifest` | Path of `manifest.json`. |
 | `proton_cli` | Absolute path to the Proton Drive CLI binary. |
-| `remote_folder` | Proton Drive folder receiving the archive + manifest (created on first run). |
-| `remote_keep` | How many remote `backup_*.zip` files to keep. Older ones are moved to Proton's trash only **after** a new upload succeeds. Minimum 1. |
-| `min_free_gb` | Safety margin: a backup aborts (with a notification) if writing it would leave less than this much free disk space. |
-| `max_zip_gb` | If > 0, the upload is skipped (with a "storage" notification) when the archive exceeds this size. `0` = unlimited. |
+| `remote_folder` | Proton Drive folder receiving the chunks + manifest (the full path is created on first run). |
+| `chunk_mb` | Target chunk size in MB. Files are first-fit packed up to this cap; a **file larger than the cap gets its own dedicated chunk** — it is never split. Bigger chunks = fewer remote files but more data to re-upload per change and to download per restore. |
+| `keep_local_chunks` | `false` (default): local chunk zips are deleted once uploaded — Proton Drive is the only copy and disk space is freed. `true`: keep local copies too (uses disk, but restores never download). |
+| `min_free_gb` | Safety margin: a backup aborts (with a notification) if building its chunks would leave less than this much free disk space. |
 | `exclude` | Glob patterns matched against file **and directory names** (not full paths). Matching items are ignored everywhere: sync dirs, dropzone, and `--advice` scans. |
 
 ## Multiple configurations
 
 Every command accepts `--config PATH`, so you can keep independent backup sets
-(e.g. a work set and a personal set), each with its own manifest, archive and
-remote folder. Note the two sets must use different `backup_dir` values.
+(e.g. a work set and a personal set), each with its own manifest, chunks and
+remote folder. The sets must use different `backup_dir` values.
 
 ## Dropzone behavior details
 
 - Hidden files (`.foo`) at the top level are ignored.
 - An entry (file or folder) is skipped for one run if anything inside it was
   modified in the last 30 seconds — this avoids archiving half-copied files.
+- Originals are moved to the Trash **only after** their chunk's upload has
+  been confirmed. With `--no-upload`, or after a failed upload, everything
+  stays where it is and the next run finishes the job.
 - Name collisions with already-archived content get a timestamp suffix
   (`report.pdf` → `report_20260704_213000.pdf`) so nothing is overwritten.
-- A dropped folder is only trashed when **every** file inside it verified.
+- A dropped folder is only trashed when **every** file inside it is uploaded.
+
+## Large files (videos, disk images, …)
+
+Files above `chunk_mb` are placed alone in their own chunk and stored inside
+the zip **without recompression** when the format is already compressed
+(`.mp4`, `.mov`, `.heic`, `.jpg`, `.zip`, …) — archiving a big video is
+essentially a copy plus a checksum, not a slow deflate. Restoring it later
+downloads exactly that one chunk.

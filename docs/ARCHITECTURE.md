@@ -1,41 +1,76 @@
 # Architecture
 
+## The chunk model
+
+The backup is not one monolithic zip but a set of size-capped **chunks**
+(default 500 MB), each an ordinary zip file, all living remotely under
+`remote_folder` (e.g. `/Backups/MacBookAir/`) next to `manifest.json`.
+Local chunk files are deleted as soon as their upload is confirmed — freeing
+disk space is the point — so Proton Drive is the primary store, not a mirror.
+
+Two kinds of chunk:
+
+- **Sync chunks** (`sync-00001.zip`, …) hold files from the configured sync
+  directories. When a member changes, the whole chunk is rebuilt *from the
+  live local files* — sync data still exists on disk by definition, so an
+  update never needs a download — and re-uploaded with `-c replace` under the
+  same name. Chunks without a changed member are never touched: a one-file
+  edit re-uploads one chunk, not the whole backup.
+- **Archive chunks** (`arch-00002.zip`, …) hold dropzone files. They are
+  write-once: once uploaded they are never rebuilt or re-uploaded, because
+  their originals no longer exist locally.
+
+### Files larger than the cap
+
+A file bigger than `chunk_mb` is **never split across chunks** — it gets a
+dedicated chunk containing just that file. Splitting would let one corrupted
+chunk destroy the file and complicate restore for no benefit; Proton Drive
+handles multi-GB single files fine. Additionally, already-compressed formats
+(video, audio, photos, archives — see `STORED_SUFFIXES`) are stored in the
+zip without recompression: deflating a 4 GB video costs minutes of CPU for
+well under 1 % size gain.
+
 ## Pipeline of a backup run
 
 ```
-lock (flock) ─▶ diff sync dirs ─▶ scan dropzone ─▶ free-space check
-      ─▶ write zip (create or in-place update) ─▶ verify (CRC + SHA-256)
-      ─▶ rotate zip filename ─▶ save manifest ─▶ trash verified dropzone items
-      ─▶ upload to Proton Drive ─▶ prune old remote zips ─▶ notify
+lock (flock) ─▶ reconcile lost chunks ─▶ diff sync dirs ─▶ scan dropzone
+  ─▶ plan (rebuild dirty sync chunks, pack new files into new chunks)
+  ─▶ free-space check ─▶ build & verify chunks ─▶ save manifest
+  ─▶ upload pending chunks ─▶ confirm remote ─▶ delete local chunk copies
+  ─▶ upload manifest ─▶ trash dropzone originals (only now) ─▶ notify
 ```
 
-Every run ends in exactly one macOS notification (unless `--no-notify`), and a
-non-zero exit code on failure so launchd logs stay meaningful.
+Every run ends in exactly one macOS notification (unless `--no-notify`), and
+a non-zero exit code on failure so launchd logs stay meaningful.
 
 ## Manifest (`manifest.json`)
 
 ```json
 {
-  "version": 1,
-  "zip_name": "backup_20260704_210000.zip",
-  "last_backup": "2026-07-04T21:00:00+04:00",
-  "last_upload": "2026-07-04T21:02:11+04:00",
+  "version": 2,
+  "last_backup": "2026-07-04T21:00:00+02:00",
+  "last_upload": "2026-07-04T21:02:11+02:00",
+  "next_chunk": 7,
+  "chunks": {
+    "sync-00001.zip": {"kind": "sync", "size": 4812392, "sha256": "…",
+                        "files": 213, "uploaded": "2026-07-04T21:01:40+02:00"},
+    "arch-00002.zip": {"kind": "archive", "size": 91832771, "sha256": "…",
+                        "files": 3, "uploaded": "2026-07-03T21:01:12+02:00"}
+  },
   "files": {
     "Sync/Documents/notes.md": {
-      "size": 1234,
-      "mtime_ns": 1751648400000000000,
-      "sha256": "…",
-      "source": "sync",
-      "origin": "/Users/you/Documents/notes.md"
+      "size": 1234, "mtime_ns": 1751648400000000000, "sha256": "…",
+      "source": "sync", "origin": "/Users/you/Documents/notes.md",
+      "chunk": "sync-00001.zip"
     }
   }
 }
 ```
 
-Archive layout: sync dirs live under `Sync/<dir-basename>/<relative-path>`,
-dropzone items under `Archive/<relative-path>`. The manifest is written
-atomically (temp file + `os.replace`), so a crash can never leave a truncated
-manifest next to a good archive.
+Archive layout inside chunks: sync dirs under `Sync/<dir-basename>/<relpath>`,
+dropzone items under `Archive/<relpath>`. The manifest is written atomically
+(temp file + `os.replace`) and re-saved after every uploaded chunk, so an
+interrupted run resumes exactly where it stopped.
 
 ## I/O-efficient diffing
 
@@ -44,69 +79,51 @@ manifest next to a good archive.
    tree costs one `stat()` per file and zero reads (rsync-style fast path).
 2. Only new or stat-changed files are hashed, using `hashlib.file_digest`
    (chunked, implemented in C). A file that was touched but is byte-identical
-   only gets its `mtime_ns` refreshed in the manifest — no archive write.
-3. The result is a classified change set: `added`, `changed`, `deleted`,
-   `touched`.
+   only gets its `mtime_ns` refreshed — no chunk rebuild.
+3. The change set (`added`, `changed`, `deleted`, `touched`) maps to chunk
+   work: changed/deleted members mark their chunk dirty for a rebuild; added
+   files are first-fit packed into new chunks; a chunk whose last member was
+   deleted is removed (and trashed remotely after the next successful sync).
 
-## Zip update strategy
+## Upload lifecycle & deletion safety
 
-`zipfile.ZipFile` cannot replace or remove entries in place, so:
+The order of operations is the safety argument:
 
-- **First build / recovery** — a fresh archive is written with `zipfile`
-  (to a temp name, then atomically renamed).
-- **Updates** — added/changed files are staged as *symlinks* in a temp tree
-  mirroring the archive layout, and the system `/usr/bin/zip` is invoked from
-  that tree. Plain add mode replaces existing entries unconditionally (unlike
-  `zip -u`, which trusts mtimes) and follows symlinks, so no data is copied
-  during staging and only the changed entries are recompressed. Deletions go
-  through `zip -d` (with glob metacharacters escaped, since `-d` takes
-  patterns). `zip` rewrites the archive container, but never re-reads or
-  recompresses unchanged entries' data.
+1. A chunk is built locally and verified: full CRC check, plus — for archive
+   chunks — every member is streamed back out of the zip and its SHA-256
+   compared to the original file's hash.
+2. It is uploaded (`filesystem upload -c replace`), and its remote presence
+   is checked with `filesystem info` (size comparison, best effort — the CLI
+   offers no stronger integrity query).
+3. Only then: the local chunk copy is deleted (unless `keep_local_chunks`),
+   and — for archive chunks — the dropzone originals are moved to Finder's
+   Trash, so even a catastrophic bug is recoverable until you empty it.
 
-After every write the archive is CRC-checked (`ZipFile.testzip()`).
+A failed or interrupted upload leaves everything in place: the chunk stays in
+`backup_dir`, dropzone originals stay put, and the next run picks up the
+pending uploads first. If a never-uploaded chunk vanishes from disk, sync
+chunks are silently rebuilt from the live files and archive chunks are
+dropped from the manifest — harmless, because their originals are still in
+the dropzone and get re-archived.
 
-## Dropzone verification & deletion safety
+Upload failures are classified by pattern-matching the CLI output — *storage
+full*, *login expired*, *generic* — each with its own notification text (the
+Proton CLI exposes no quota query, so detection is reactive).
 
-A dropzone original is moved to the Trash only after all of these hold:
+## Restore
 
-1. its SHA-256 was computed from the local file,
-2. the copy **inside the finished zip** was streamed back out and re-hashed,
-3. the two hashes match, and
-4. (for folders) every file in the folder passed 1–3.
-
-Deletion uses Finder's Trash via `osascript`, so even a catastrophic bug is
-recoverable until you empty the Trash. If verification fails, the file stays,
-the manifest does not record it, and the run reports failure — the next run
-retries automatically.
-
-If the archive itself disappears from disk, the tool rebuilds it from the sync
-dirs, but archived dropzone entries cannot be restored locally; they are
-dropped from the manifest and listed loudly in the log and a notification, so
-the advisor never calls a file "safe to delete" against a backup that no
-longer exists.
-
-## Storage safety checks
-
-- **Local, before writing**: `shutil.disk_usage` must show room for
-  *current archive size + bytes being added + `min_free_gb`* — the worst case,
-  because `zip` builds a temp copy of the archive next to the original.
-- **Before upload**: optional `max_zip_gb` cap.
-- **Remote**: the Proton Drive CLI has no quota query, so upload failures are
-  classified by pattern-matching the CLI output into *storage full*, *login
-  expired* and *generic* — each with its own notification text.
-
-## Upload & remote retention
-
-The archive filename is timestamped, so each upload creates a new remote file
-(`manifest.json` is overwritten in place via `-c replace`). Remote zips beyond
-`remote_keep` are moved to Proton's trash **only after** the new upload
-succeeded — the previous good backup is never deleted first. A failed upload
-leaves the local backup intact and is retried on the next run.
+`--restore <name>` looks the file(s) up in the manifest, downloads **only the
+chunk(s) that contain them** (or uses a local copy if one still exists),
+extracts, and verifies each restored file against its manifest SHA-256.
+Retrieving one file from a multi-hundred-GB backup costs one chunk download,
+bounded by `chunk_mb` (or the file's own size, for oversized solo chunks).
 
 ## Concurrency & robustness
 
 - A `flock` on `<backup_dir>/.lock` guarantees a manual run and the launchd
-  job can never write the archive concurrently.
-- All subprocesses use explicit argument lists (no shell), timeouts, and their
-  output is logged on failure.
+  job can never write chunks concurrently.
+- Free-space check before building: the sum of all planned chunk sizes plus
+  `min_free_gb` must fit.
+- All subprocesses use explicit argument lists (no shell) and timeouts
+  (6 h for transfers, 15 min otherwise); output is logged on failure.
 - Logs rotate at 1 MB (`backup_organizer.log`, 3 backups kept).

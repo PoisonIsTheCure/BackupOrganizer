@@ -1,34 +1,39 @@
 # BackupOrganizer
 
 A headless macOS backup manager and smart storage advisor, written in pure-stdlib
-Python. It keeps a single timestamped `.zip` of your important directories, offers
-a hash-verified "Archive Dropzone" for offloading files, tells you exactly which
-local files are safe to delete, and mirrors everything to Proton Drive.
+Python. It packs your important directories and an "Archive Dropzone" into
+size-capped zip **chunks**, uploads them to Proton Drive, then deletes the local
+copies to free disk space — and can restore any single file by downloading only
+the one chunk that contains it.
 
 ## Features
 
-- **Sync directories** — configured folders are compressed into one archive.
-  Re-runs are I/O-efficient: unchanged files cost a single `stat()` call, and only
-  new/changed entries are (re)compressed via the system `zip` tool.
-- **Archive Dropzone** — drop a file (or folder) in; it is added to the archive,
-  the copy *inside the zip* is re-hashed and compared to the original, and only on
-  a byte-perfect match is the original moved to the Trash.
-- **Manifest state tracking** — `manifest.json` records the path, size, mtime and
-  SHA-256 of every archived file, plus the last backup/upload timestamps.
+- **Chunked backups** — data is packed into ~500 MB zip chunks. A changed file
+  only rebuilds and re-uploads *its own* chunk, never the whole backup; files
+  larger than the cap get a dedicated chunk of their own (never split), and
+  already-compressed formats (video, photos, audio) are stored without
+  recompression.
+- **Space freeing by design** — once a chunk's upload is confirmed, the local
+  copy is deleted. Proton Drive is the primary store, not a mirror.
+- **Archive Dropzone** — drop a file (or folder) in; it is packed into a chunk,
+  hash-verified inside the zip, uploaded — and only after the remote copy is
+  confirmed is the original moved to the Trash.
+- **Single-file restore** — `--restore invoice.pdf` finds the file in the
+  manifest, downloads just its chunk, extracts and hash-verifies it.
+- **Manifest state tracking** — `manifest.json` records the path, size, mtime,
+  SHA-256 and chunk of every file. Diffing is I/O-efficient: unchanged files
+  cost one `stat()` call, zero reads.
 - **Storage advisor** — `--advice DIR` reports which files in a directory are
-  byte-identical to a backed-up copy (safe to delete) and which are not.
-- **Storage safety** — free-disk-space check before any archive write, optional
-  archive size cap before upload, and classified Proton Drive failures
+  byte-identical to an *uploaded* copy (safe to delete) and which are not.
+- **Storage safety** — free-disk-space check before building chunks, remote
+  size confirmation after upload, and classified Proton Drive failures
   (storage full vs. login expired vs. network).
-- **Proton Drive upload** — the archive and manifest are uploaded with the
-  official Proton Drive CLI; older remote archives are pruned only *after* the
-  new upload succeeds.
 - **Native notifications** — every background run ends in a macOS notification
   (success summary or a specific failure reason).
 
 ## Requirements
 
-- macOS (uses `/usr/bin/zip`, `osascript`, Finder Trash, launchd)
+- macOS (uses `osascript`, Finder Trash, launchd)
 - Python 3.11+ (no third-party packages)
 - [Proton Drive CLI](https://proton.me/drive), authenticated via
   `proton-drive auth login`
@@ -47,6 +52,9 @@ python3 backup_organizer.py --verbose
 # 4. Check on things any time
 python3 backup_organizer.py --status
 python3 backup_organizer.py --advice ~/Downloads
+
+# 5. Get a file back (downloads only the chunk that holds it)
+python3 backup_organizer.py --restore holiday.mov
 ```
 
 See [docs/CONFIGURATION.md](docs/CONFIGURATION.md) for every config key and
@@ -57,11 +65,13 @@ and upload pipeline works.
 
 | Flag | Effect |
 | --- | --- |
-| *(none)* | Run a backup, then upload to Proton Drive |
-| `--status` | Print file count, total size, archive name, last backup/upload |
+| *(none)* | Run a backup: build changed chunks, upload, free local space |
+| `--status` | Print file/chunk counts, sizes, pending uploads, last backup/upload |
 | `--advice DIR` | Report which files in `DIR` are safely backed up |
+| `--restore NAME` | Restore file(s) matching a name/substring/glob (see `--dest`) |
+| `--dest DIR` | Destination for `--restore` (default: `~/Downloads/BackupOrganizer-Restore`) |
 | `--init` | Write a default `config.json` and create the dropzone |
-| `--no-upload` | Back up locally only |
+| `--no-upload` | Build chunks locally only; nothing is deleted or trashed |
 | `--dry-run` | Show what would change without writing anything |
 | `--no-notify` | Suppress macOS notifications |
 | `--config PATH` | Use an alternate config file |
@@ -127,14 +137,22 @@ macOS dialog. Keep it in the project folder or drag it to your Desktop/Dock.
 
 ## Data layout
 
-Everything lives outside the repo, in `~/Backups/BackupOrganizer/`:
+Locally (outside the repo), `~/Backups/BackupOrganizer/` holds:
 
 ```
 config.json            your configuration
-backup_<timestamp>.zip the archive (name = time of last successful backup)
-manifest.json          state: hashes, sizes, timestamps
+sync-00001.zip, ...    chunks being built or awaiting upload (deleted once uploaded)
+manifest.json          state: hashes, sizes, chunk assignments, timestamps
 backup_organizer.log   rotating log
 launchd.log            stdout/stderr of scheduled runs
+```
+
+On Proton Drive, everything sits in one folder (default `/Backups/MacBookAir`):
+
+```
+sync-00001.zip         chunks of the sync directories
+arch-00002.zip         write-once chunks of archived dropzone files
+manifest.json          always the latest state
 ```
 
 ## License
