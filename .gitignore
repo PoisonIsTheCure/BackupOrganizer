@@ -1,0 +1,15 @@
+# macOS
+.DS_Store
+._*
+
+# Backup data never lives in the repo
+*.zip
+manifest.json
+*.log
+
+# Compiled AppleScript app (build locally with osacompile)
+Backup Status.app/
+
+# Python
+__pycache__/
+*.pyc

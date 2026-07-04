@@ -1,0 +1,2 @@
+#!/bin/zsh
+exec /opt/homebrew/bin/python3 /Users/alyz/DevProjects/Python/Tools/BackupOrganizer/backup_organizer.py "$@"
