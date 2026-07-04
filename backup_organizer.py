@@ -383,20 +383,35 @@ def diff_sync_dirs(cfg: Config, manifest: Manifest) -> SyncDiff:
     return diff
 
 
-def scan_dropzone(cfg: Config, manifest: Manifest) -> tuple[list[Member], dict[Path, list[str]]]:
+def scan_dropzone(cfg: Config, manifest: Manifest) -> tuple[
+        list[Member], dict[Path, list[str]], dict[str, list[dict]]]:
     """Collect dropzone files ready for archiving.
 
-    Returns the members plus a map of top-level dropzone entries to the
-    arcnames they contain, so an entry is only trashed once every file in it
-    is confirmed uploaded.
+    Returns (members, groups, relocations):
+    - groups maps top-level dropzone entries to the arcnames they contain, so
+      an entry is only trashed once every file in it is confirmed uploaded.
+    - relocations maps a new archive arcname to the *sync* manifest entries
+      holding identical content: the dropped file was copied out of a synced
+      area, so once the archive copy is confirmed uploaded the sync-area
+      original is trashed too — only the archived copy stays, no duplicate.
+    Content already archived under another name is not stored twice: the
+    dropped file just joins its group and is trashed once that chunk is up.
     """
     pending: list[Member] = []
     groups: dict[Path, list[str]] = {}
+    relocations: dict[str, list[dict]] = {}
     if not cfg.dropzone.is_dir():
-        return pending, groups
+        return pending, groups, relocations
 
     cutoff = datetime.datetime.now().timestamp() - DROPZONE_SETTLE_SECONDS
     existing_names = set(manifest.files)
+    by_content: dict[str, list[tuple[str, dict]]] = {}
+    for a, e in manifest.files.items():
+        by_content.setdefault(e["sha256"], []).append((a, e))
+
+    def safely_stored(entry: dict) -> bool:
+        chunk = manifest.chunks.get(entry.get("chunk", ""))
+        return bool(chunk and (chunk["uploaded"] or cfg.chunk_path(entry["chunk"]).is_file()))
 
     for top in sorted(cfg.dropzone.iterdir()):
         if top.name.startswith(".") or cfg.is_excluded(top.name):
@@ -413,13 +428,31 @@ def scan_dropzone(cfg: Config, manifest: Manifest) -> tuple[list[Member], dict[P
             digest = sha256_file(path)
             arcname = "Archive/" + path.relative_to(cfg.dropzone).as_posix()
             prior = manifest.files.get(arcname)
-            if prior and prior["sha256"] == digest:
-                chunk = manifest.chunks.get(prior.get("chunk", ""))
-                if chunk and (chunk["uploaded"] or cfg.chunk_path(prior["chunk"]).is_file()):
-                    # Identical content is already in a chunk (uploaded, or
-                    # built and awaiting upload): don't archive it again.
-                    group.append(arcname)
-                    continue
+            matches = by_content.get(digest, [])
+            # Sync entries with identical content: the file was copied out of
+            # a synced area, so those originals are retired once the archive
+            # copy is confirmed uploaded — recorded on every path, because
+            # the confirmation may only happen on a later run.
+            sync_twins = [dict(e) for a, e in matches if e["source"] == "sync"]
+            if prior and prior["sha256"] == digest and safely_stored(prior):
+                # Identical content is already in a chunk (uploaded, or built
+                # and awaiting upload): don't archive it again.
+                group.append(arcname)
+                if sync_twins:
+                    relocations[arcname] = sync_twins
+                continue
+            arch_twin = next(
+                (a for a, e in matches
+                 if e["source"] == "dropzone" and a != arcname and safely_stored(e)),
+                None,
+            )
+            if arch_twin:
+                log.info("Dropzone %s is already archived as %s; not storing it twice.",
+                         path.name, arch_twin)
+                group.append(arch_twin)
+                if sync_twins:
+                    relocations[arch_twin] = sync_twins
+                continue
             if prior and prior["sha256"] != digest:
                 # Same name, different content: keep both by timestamping the new one.
                 stem, dot, ext = arcname.rpartition(".")
@@ -427,12 +460,14 @@ def scan_dropzone(cfg: Config, manifest: Manifest) -> tuple[list[Member], dict[P
                 arcname = f"{stem}_{stamp}.{ext}" if dot else f"{arcname}_{stamp}"
                 while arcname in existing_names:
                     arcname += "_1"
+            if sync_twins:
+                relocations[arcname] = sync_twins
             existing_names.add(arcname)
             pending.append(Member(arcname, path, st.st_size, st.st_mtime_ns,
                                   digest, source="dropzone"))
             group.append(arcname)
         groups[top] = group
-    return pending, groups
+    return pending, groups, relocations
 
 
 # --------------------------------------------------------------------------- #
@@ -748,7 +783,7 @@ def cmd_backup(cfg: Config, do_upload: bool, dry_run: bool, notify_enabled: bool
     forced_rebuilds = reconcile_chunks(cfg, manifest)
 
     diff = diff_sync_dirs(cfg, manifest)
-    dropzone_members, dropzone_groups = scan_dropzone(cfg, manifest)
+    dropzone_members, dropzone_groups, relocations = scan_dropzone(cfg, manifest)
 
     rebuild_plans, emptied_chunks = plan_rebuilds(cfg, manifest, diff)
     planned = {p.name for p in rebuild_plans}
@@ -826,6 +861,7 @@ def cmd_backup(cfg: Config, do_upload: bool, dry_run: bool, notify_enabled: bool
     # ----- trash dropzone originals whose chunks are confirmed uploaded ---- #
     trashed = 0
     waiting = 0
+    relocated = 0
     for top, arcnames in dropzone_groups.items():
         fully_uploaded = all(
             a in manifest.files
@@ -836,6 +872,24 @@ def cmd_backup(cfg: Config, do_upload: bool, dry_run: bool, notify_enabled: bool
             if move_to_trash(top):
                 trashed += 1
                 log.info("Uploaded and trashed dropzone entry: %s", top.name)
+            # The dropped content was copied out of a synced area: now that
+            # the archive copy is confirmed uploaded, retire the sync-area
+            # original so only the archived copy remains.
+            for arc in arcnames:
+                for twin in relocations.get(arc, []):
+                    p = Path(twin["origin"])
+                    if not p.is_file():
+                        continue  # was a true move, nothing left to retire
+                    st = p.stat()
+                    unchanged = (st.st_size == twin["size"]
+                                 and st.st_mtime_ns == twin["mtime_ns"]) \
+                        or sha256_file(p) == twin["sha256"]
+                    if not unchanged:
+                        log.warning("Sync copy of archived %s changed; keeping it: %s", arc, p)
+                        continue
+                    if move_to_trash(p):
+                        relocated += 1
+                        log.info("Retired sync copy of archived %s: %s", arc, p)
         else:
             waiting += 1
             log.info("Dropzone entry kept until its upload is confirmed: %s", top.name)
@@ -847,6 +901,8 @@ def cmd_backup(cfg: Config, do_upload: bool, dry_run: bool, notify_enabled: bool
     parts = [f"{len(diff.added)} added, {len(diff.changed)} updated, {len(diff.deleted)} removed"]
     if trashed or waiting:
         parts.append(f"{trashed} dropzone item(s) offloaded")
+    if relocated:
+        parts.append(f"{relocated} sync cop(ies) retired to archive")
     if uploaded:
         parts.append(f"{uploaded} chunk(s) uploaded")
     if freed:

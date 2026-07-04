@@ -53,6 +53,13 @@ remote folder. The sets must use different `backup_dir` values.
 - Name collisions with already-archived content get a timestamp suffix
   (`report.pdf` → `report_20260704_213000.pdf`) so nothing is overwritten.
 - A dropped folder is only trashed when **every** file inside it is uploaded.
+- **No duplicates on archive**: if the dropped content is byte-identical to a
+  file in a synced area (i.e. it was *copied* there), the sync-area original
+  is also moved to the Trash once the archive copy is confirmed uploaded —
+  only the archived copy stays. Content that is already archived under
+  another name is never stored twice; the dropped file is simply trashed
+  once its existing chunk is confirmed. A sync copy that changed since its
+  backup is never touched.
 
 ## Large files (videos, disk images, …)
 
