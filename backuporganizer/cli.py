@@ -7,8 +7,8 @@ import fcntl
 import sys
 from pathlib import Path
 
-from .commands import (cmd_advice, cmd_backup, cmd_dedupe, cmd_init,
-                       cmd_restore, cmd_status)
+from .commands import (cmd_add_sync, cmd_advice, cmd_archive, cmd_backup,
+                       cmd_dedupe, cmd_init, cmd_restore, cmd_status)
 from .config import DEFAULT_CONFIG_PATH, Config, ConfigError
 from .util import APP_NAME, BackupError, log, notify, setup_logging
 from .viewer import cmd_browse, cmd_tree
@@ -46,6 +46,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dry-run", action="store_true", help="show changes without writing")
     parser.add_argument("--no-notify", action="store_true", help="suppress macOS notifications")
     parser.add_argument("--verbose", action="store_true", help="chatty console output")
+
+    sub = parser.add_subparsers(dest="command", metavar="command",
+                                title="commands (optional; no command = run)")
+    sub.add_parser("run", help="full cycle: scan for changes, build chunks, "
+                               "upload to Proton Drive, free local space")
+    archive_p = sub.add_parser(
+        "archive", help="move files/folders into the dropzone and run the cycle")
+    archive_p.add_argument("paths", nargs="+", type=Path, metavar="PATH")
+    archive_p.add_argument("--no-run", action="store_true",
+                           help="only stage into the dropzone; archive on the next run")
+    addsync_p = sub.add_parser(
+        "add-sync", help="add folder(s) to sync_dirs and run the cycle")
+    addsync_p.add_argument("dirs", nargs="+", type=Path, metavar="DIR")
+    addsync_p.add_argument("--no-run", action="store_true",
+                           help="only update the config; back up on the next run")
     return parser
 
 
@@ -92,6 +107,19 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.dedupe is not None:
             return cmd_dedupe(cfg, args.dedupe, notify_enabled)
+        if args.command == "archive":
+            return cmd_archive(cfg, args.paths, run=not args.no_run,
+                               do_upload=not args.no_upload,
+                               notify_enabled=notify_enabled)
+        if args.command == "add-sync":
+            try:
+                return cmd_add_sync(args.config, args.dirs, run=not args.no_run,
+                                    do_upload=not args.no_upload,
+                                    notify_enabled=notify_enabled)
+            except ConfigError as exc:
+                print(f"Config error: {exc}", file=sys.stderr)
+                return 2
+        # bare invocation or explicit `run`: the full cycle
         return cmd_backup(cfg, do_upload=not args.no_upload,
                           dry_run=args.dry_run, notify_enabled=notify_enabled)
     except BackupError as exc:

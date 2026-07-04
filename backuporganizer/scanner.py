@@ -83,7 +83,8 @@ def diff_sync_dirs(cfg: Config, manifest: Manifest) -> SyncDiff:
     return diff
 
 
-def scan_dropzone(cfg: Config, manifest: Manifest) -> tuple[
+def scan_dropzone(cfg: Config, manifest: Manifest,
+                  settle_seconds: int = DROPZONE_SETTLE_SECONDS) -> tuple[
         list[Member], dict[Path, list[str]], dict[str, list[dict]]]:
     """Collect dropzone files ready for archiving.
 
@@ -105,7 +106,7 @@ def scan_dropzone(cfg: Config, manifest: Manifest) -> tuple[
     if not cfg.dropzone.is_dir():
         return pending, groups, relocations
 
-    cutoff = datetime.datetime.now().timestamp() - DROPZONE_SETTLE_SECONDS
+    cutoff = datetime.datetime.now().timestamp() - settle_seconds
     existing_names = set(manifest.files)
     by_content: dict[str, list[tuple[str, dict]]] = {}
     for a, e in manifest.files.items():

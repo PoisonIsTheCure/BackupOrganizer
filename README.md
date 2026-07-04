@@ -72,9 +72,26 @@ and upload pipeline works.
 
 ## CLI
 
+### Commands
+
+```sh
+backup-organizer run                     # full cycle: scan, chunk, upload, free space
+backup-organizer archive ~/Movies/old    # move into the dropzone + run the cycle
+backup-organizer add-sync ~/Projects     # add a folder to sync_dirs + run the cycle
+```
+
+`run` is the same as invoking `backup-organizer` with no arguments. `archive`
+takes any number of files/folders, skips the dropzone settle delay (you just
+told it the files are complete), and archiving something from *inside* a sync
+dir is a clean move-to-archive. `add-sync` validates the new folders (must
+exist, unique basenames, no dropzone overlap) before touching the config.
+Both accept `--no-run` to stage only, and honor `--no-upload`.
+
+### Flags
+
 | Flag | Effect |
 | --- | --- |
-| *(none)* | Run a backup: build changed chunks, upload, free local space |
+| *(none)* / `run` | Run a backup: build changed chunks, upload, free local space |
 | `--status` | Print file/chunk counts, sizes, pending uploads, last backup/upload |
 | `--advice DIR` | Report which files in `DIR` are safely backed up |
 | `--tree [PREFIX]` | Print the backed-up file tree, optionally under a path prefix |

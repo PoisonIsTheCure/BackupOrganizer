@@ -15,12 +15,14 @@ from .chunks import (ChunkPlan, build_chunk, check_free_space, pack_new_members,
 from .config import DEFAULT_CONFIG, Config
 from .manifest import Manifest, Member
 from .proton import UPLOAD_FAIL_MESSAGES, UploadError, download_chunk, upload_pending
-from .scanner import diff_sync_dirs, scan_dropzone, walk_files
+from .scanner import (DROPZONE_SETTLE_SECONDS, diff_sync_dirs, scan_dropzone,
+                      walk_files)
 from .util import (APP_NAME, human_size, log, move_to_trash, notify, now_iso,
                    sha256_file)
 
 
-def cmd_backup(cfg: Config, do_upload: bool, dry_run: bool, notify_enabled: bool) -> int:
+def cmd_backup(cfg: Config, do_upload: bool, dry_run: bool, notify_enabled: bool,
+               settle_seconds: int = DROPZONE_SETTLE_SECONDS) -> int:
     """One full backup run: diff, build chunks, upload, free local space.
 
     See docs/ARCHITECTURE.md for the pipeline and its safety ordering; the
@@ -31,7 +33,9 @@ def cmd_backup(cfg: Config, do_upload: bool, dry_run: bool, notify_enabled: bool
     forced_rebuilds = reconcile_chunks(cfg, manifest)
 
     diff = diff_sync_dirs(cfg, manifest)
-    dropzone_members, dropzone_groups, relocations = scan_dropzone(cfg, manifest)
+    dropzone_members, dropzone_groups, relocations = scan_dropzone(
+        cfg, manifest, settle_seconds
+    )
 
     rebuild_plans, emptied_chunks = plan_rebuilds(cfg, manifest, diff.deleted, diff.changed)
     planned = {p.name for p in rebuild_plans}
@@ -418,6 +422,84 @@ def cmd_dedupe(cfg: Config, min_mb: float, notify_enabled: bool) -> int:
         return cmd_backup(cfg, do_upload=True, dry_run=False, notify_enabled=notify_enabled)
     print("Chunks will be updated on the next backup run.")
     return 0
+
+
+def cmd_archive(cfg: Config, paths: list[Path], run: bool, do_upload: bool,
+                notify_enabled: bool) -> int:
+    """Move files/folders into the dropzone, then run the full cycle.
+
+    The dropzone settle delay is skipped: an explicit `archive` invocation
+    means the files are complete. Archiving something from inside a sync dir
+    is a natural move-to-archive: the sync side sees the deletion, the
+    archive side stores it, exactly one copy remains.
+    """
+    cfg.dropzone.mkdir(parents=True, exist_ok=True)
+    moved = 0
+    for raw in paths:
+        p = raw.expanduser()
+        if not p.exists():
+            print(f"Not found, skipped: {p}", file=sys.stderr)
+            continue
+        if cfg.dropzone in p.parents or p == cfg.dropzone:
+            print(f"Already in the dropzone, skipped: {p}")
+            continue
+        dest = cfg.dropzone / p.name
+        if dest.exists():
+            stamp = now_iso().replace(":", "").replace("-", "")[:15]
+            dest = cfg.dropzone / f"{p.stem}_{stamp}{p.suffix}"
+        shutil.move(str(p), dest)
+        moved += 1
+        print(f"→ dropzone: {p}  (as {dest.name})")
+    if moved == 0:
+        print("Nothing to archive.")
+        return 1
+    if not run:
+        print(f"{moved} item(s) staged; they will be archived on the next backup run.")
+        return 0
+    print(f"{moved} item(s) staged — running the backup cycle now.")
+    return cmd_backup(cfg, do_upload=do_upload, dry_run=False,
+                      notify_enabled=notify_enabled, settle_seconds=0)
+
+
+def cmd_add_sync(config_path: Path, dirs: list[Path], run: bool, do_upload: bool,
+                 notify_enabled: bool) -> int:
+    """Add folder(s) to sync_dirs in the config, then run the full cycle.
+
+    The updated config is validated (existence, basename collisions,
+    dropzone overlap) before the file is rewritten; on any error nothing
+    is changed. Single files cannot be synced — archive them instead.
+    """
+    raw = json.loads(config_path.read_text())
+    current = [str(Path(d).expanduser()) for d in raw.get("sync_dirs", [])]
+    added = []
+    for d in dirs:
+        p = d.expanduser().resolve()
+        if not p.is_dir():
+            print(f"Not a directory: {p} — sync entries must be folders; "
+                  "use `archive` for single files.", file=sys.stderr)
+            return 2
+        if str(p) in current:
+            print(f"Already a sync dir, skipped: {p}")
+            continue
+        current.append(str(p))
+        added.append(p)
+    if not added:
+        print("Nothing new to add.")
+        return 1
+
+    candidate = dict(raw)
+    candidate["sync_dirs"] = current
+    cfg = Config.from_raw(candidate)  # raises ConfigError on collisions/overlap
+
+    config_path.write_text(json.dumps(candidate, indent=2) + "\n")
+    for p in added:
+        print(f"Added to sync: {p}")
+    if not run:
+        print("They will be backed up on the next run.")
+        return 0
+    print("Running the backup cycle now.")
+    return cmd_backup(cfg, do_upload=do_upload, dry_run=False,
+                      notify_enabled=notify_enabled)
 
 
 def cmd_init(config_path: Path) -> int:

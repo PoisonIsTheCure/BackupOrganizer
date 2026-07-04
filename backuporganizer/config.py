@@ -84,10 +84,15 @@ class Config:
                 f"Config not found at {path}. Run with --init to create a default one."
             )
         try:
-            raw = {**DEFAULT_CONFIG, **json.loads(path.read_text())}
+            raw = json.loads(path.read_text())
         except json.JSONDecodeError as exc:
             raise ConfigError(f"Invalid JSON in {path}: {exc}") from exc
+        return cls.from_raw(raw)
 
+    @classmethod
+    def from_raw(cls, raw: dict) -> "Config":
+        """Build and validate a Config from a raw dict (defaults filled in)."""
+        raw = {**DEFAULT_CONFIG, **raw}
         cfg = cls(
             sync_dirs=[Path(p).expanduser() for p in raw["sync_dirs"]],
             dropzone=Path(raw["dropzone"]).expanduser(),
