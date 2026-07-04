@@ -1197,6 +1197,156 @@ def cmd_browse(cfg: Config, out: Path | None) -> int:
     return 0
 
 
+def repack_archive_chunk(cfg: Config, manifest: Manifest, chunk_name: str,
+                         remove: set[str]) -> None:
+    """Rebuild an archive chunk without the removed entries.
+
+    Downloads the chunk first if no local copy exists. The rebuilt chunk is
+    hash-verified and left pending upload (same name, replaced remotely on
+    the next upload); a chunk left with no entries is deleted outright.
+    """
+    meta = manifest.chunks[chunk_name]
+    keep = [a for a, e in manifest.files.items()
+            if e.get("chunk") == chunk_name and a not in remove]
+    was_uploaded = bool(meta["uploaded"])
+    local = cfg.chunk_path(chunk_name)
+    with tempfile.TemporaryDirectory(dir=cfg.backup_dir) as tmp:
+        src = local if local.is_file() else download_chunk(cfg, chunk_name, Path(tmp))
+        if keep:
+            new = Path(tmp) / f"repack_{chunk_name}"
+            with zipfile.ZipFile(src) as zin, zipfile.ZipFile(new, "w") as zout:
+                for arc in keep:
+                    info = zin.getinfo(arc)
+                    zi = zipfile.ZipInfo(arc, date_time=info.date_time)
+                    zi.compress_type = info.compress_type
+                    with zin.open(arc) as r, zout.open(zi, mode="w") as w:
+                        shutil.copyfileobj(r, w, 1024 * 1024)
+            with zipfile.ZipFile(new) as zf:
+                if zf.testzip() is not None:
+                    raise BackupError(f"Repacked {chunk_name} failed its CRC check.")
+                for arc in keep:
+                    if sha256_zip_entry(zf, arc) != manifest.files[arc]["sha256"]:
+                        raise BackupError(
+                            f"Verification failed while repacking {chunk_name}; "
+                            "nothing was removed."
+                        )
+            os.replace(new, local)
+            meta.update(size=local.stat().st_size, sha256=sha256_file(local),
+                        files=len(keep), uploaded="")
+        else:
+            local.unlink(missing_ok=True)
+            del manifest.chunks[chunk_name]
+    for arc in remove:
+        manifest.files.pop(arc, None)
+    if not keep and was_uploaded:
+        proc = proton(cfg, "filesystem", "trash", cfg.remote_path(chunk_name))
+        if proc.returncode != 0:
+            log.warning("Could not trash remote %s: %s", chunk_name, proc.stderr.strip())
+    manifest.save()
+
+
+def cmd_dedupe(cfg: Config, min_mb: float, notify_enabled: bool) -> int:
+    """Find files stored more than once and interactively keep one copy."""
+    manifest = Manifest.load(cfg.manifest_path)
+    by_hash: dict[str, list[str]] = {}
+    for arc, e in manifest.files.items():
+        if e["size"] > 0:
+            by_hash.setdefault(e["sha256"], []).append(arc)
+    dupes = sorted(
+        ((manifest.files[arcs[0]]["size"], sorted(arcs)) for arcs in by_hash.values()
+         if len(arcs) > 1),
+        key=lambda t: -t[0],
+    )
+    if not dupes:
+        print("No duplicate files in the backup.")
+        return 0
+
+    threshold = int(min_mb * 1024**2)
+    big = [(s, a) for s, a in dupes if s >= threshold]
+    small = [(s, a) for s, a in dupes if s < threshold]
+    waste = sum(s * (len(a) - 1) for s, a in dupes)
+    print(f"{len(dupes)} duplicate group(s), {human_size(waste)} stored redundantly.")
+    if small:
+        small_waste = sum(s * (len(a) - 1) for s, a in small)
+        print(f"Skipping {len(small)} group(s) under {min_mb:g} MB "
+              f"({human_size(small_waste)}) — rerun with --dedupe 0 to include them.")
+    if not big:
+        return 0
+
+    trash_local: list[str] = []
+    remove_archive: set[str] = set()
+    print("\nFor each group, choose the copy to KEEP. Removed sync copies are "
+          "moved to the Trash locally;\nremoved archive copies are repacked "
+          "out of their chunks.\n")
+    for i, (size, arcs) in enumerate(big, 1):
+        print(f"[{i}/{len(big)}] {human_size(size)} × {len(arcs)} identical copies:")
+        for j, arc in enumerate(arcs, 1):
+            e = manifest.files[arc]
+            print(f"  {j}. {arc}  ({e['source']}, from {e['origin']})")
+        try:
+            choice = input("Keep which copy? [number / Enter=skip / q=stop] ").strip().lower()
+        except EOFError:
+            choice = "q"
+        if choice == "q":
+            break
+        if not choice.isdigit() or not 1 <= int(choice) <= len(arcs):
+            print("  skipped.\n")
+            continue
+        kept = arcs[int(choice) - 1]
+        for arc in arcs:
+            if arc == kept:
+                continue
+            if manifest.files[arc]["source"] == "sync":
+                trash_local.append(arc)
+            else:
+                remove_archive.add(arc)
+        print(f"  keeping {kept}\n")
+
+    if not trash_local and not remove_archive:
+        print("Nothing selected; no changes made.")
+        return 0
+
+    freed = 0
+    for arc in trash_local:
+        e = manifest.files[arc]
+        p = Path(e["origin"])
+        if not p.is_file():
+            print(f"  already gone locally: {p}")
+            continue
+        st = p.stat()
+        unchanged = (st.st_size == e["size"] and st.st_mtime_ns == e["mtime_ns"]) \
+            or sha256_file(p) == e["sha256"]
+        if not unchanged:
+            print(f"  SKIPPED (file changed since backup): {p}")
+            continue
+        if move_to_trash(p):
+            freed += e["size"]
+            print(f"  trashed local copy: {p}")
+
+    by_chunk: dict[str, set[str]] = {}
+    for arc in remove_archive:
+        by_chunk.setdefault(manifest.files[arc]["chunk"], set()).add(arc)
+    for chunk_name, arcs in sorted(by_chunk.items()):
+        try:
+            print(f"  repacking {chunk_name} without {len(arcs)} duplicate(s)...")
+            repack_archive_chunk(cfg, manifest, chunk_name, arcs)
+        except UploadError as exc:
+            print(f"  ERROR repacking {chunk_name}: {exc}", file=sys.stderr)
+            print("  Stopping here; already-applied changes are saved.", file=sys.stderr)
+            return 1
+
+    print(f"\nDone. {human_size(freed)} moved to the Trash locally"
+          f"{f', {len(remove_archive)} backup cop(ies) removed' if remove_archive else ''}.")
+    try:
+        answer = input("Run a backup now to rebuild chunks and upload the changes? [y/N] ")
+    except EOFError:
+        answer = "n"
+    if answer.strip().lower() == "y":
+        return cmd_backup(cfg, do_upload=True, dry_run=False, notify_enabled=notify_enabled)
+    print("Chunks will be updated on the next backup run.")
+    return 0
+
+
 def cmd_init(config_path: Path) -> int:
     if config_path.exists():
         print(f"Config already exists: {config_path}")
@@ -1252,6 +1402,9 @@ def main(argv: list[str] | None = None) -> int:
                              "glob, or folder path ending in /")
     parser.add_argument("--restore-all", action="store_true",
                         help="download and restore the entire backup (see --dest)")
+    parser.add_argument("--dedupe", metavar="MIN_MB", nargs="?", const=1.0, type=float,
+                        help="interactively remove duplicate copies of the same file "
+                             "(default: only files of at least 1 MB)")
     parser.add_argument("--dest", metavar="DIR", type=Path,
                         default=Path("~/Downloads/BackupOrganizer-Restore"),
                         help="destination for --restore (default: %(default)s)")
@@ -1296,6 +1449,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     try:
+        if args.dedupe is not None:
+            return cmd_dedupe(cfg, args.dedupe, notify_enabled)
         return cmd_backup(cfg, do_upload=not args.no_upload,
                           dry_run=args.dry_run, notify_enabled=notify_enabled)
     except BackupError as exc:

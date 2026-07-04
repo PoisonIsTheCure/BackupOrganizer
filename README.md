@@ -30,6 +30,10 @@ the one chunk that contains it.
   cost one `stat()` call, zero reads.
 - **Storage advisor** — `--advice DIR` reports which files in a directory are
   byte-identical to an *uploaded* copy (safe to delete) and which are not.
+- **Deduplication** — `--dedupe` finds files stored more than once (by SHA-256)
+  and asks, group by group, which copy to keep. Removed sync copies go to the
+  local Trash; removed archive copies are repacked out of their chunks. Every
+  removal is hash-verified first.
 - **Storage safety** — free-disk-space check before building chunks, remote
   size confirmation after upload, and classified Proton Drive failures
   (storage full vs. login expired vs. network).
@@ -77,6 +81,7 @@ and upload pipeline works.
 | `--browse [OUT]` | Generate an interactive HTML backup browser and open it |
 | `--restore NAME` | Restore file(s) by name/substring/glob, or a whole folder with a trailing `/` |
 | `--restore-all` | Download and restore the entire backup (see `--dest`) |
+| `--dedupe [MIN_MB]` | Interactively keep one copy of duplicated files (default: ≥ 1 MB) |
 | `--dest DIR` | Destination for `--restore` (default: `~/Downloads/BackupOrganizer-Restore`) |
 | `--init` | Write a default `config.json` and create the dropzone |
 | `--no-upload` | Build chunks locally only; nothing is deleted or trashed |
