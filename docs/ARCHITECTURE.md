@@ -118,6 +118,28 @@ extracts, and verifies each restored file against its manifest SHA-256.
 Retrieving one file from a multi-hundred-GB backup costs one chunk download,
 bounded by `chunk_mb` (or the file's own size, for oversized solo chunks).
 
+## Code layout
+
+`backup_organizer.py` is a thin launcher (kept as the stable entry point for
+the PATH shim, the launchd agent and Backup Status.app); the logic lives in
+the `backuporganizer` package:
+
+| Module | Responsibility |
+| --- | --- |
+| `config.py` | defaults, loading, validation, remote-path normalization |
+| `manifest.py` | the manifest state file, atomic saves, the `Member` record |
+| `util.py` | logging, hashing, notifications, Finder Trash |
+| `scanner.py` | walking sync dirs / the dropzone, diffing against the manifest |
+| `chunks.py` | planning, building, repacking and verifying chunk zips |
+| `proton.py` | every Proton Drive CLI call: upload, download, confirm, prune |
+| `viewer.py` | `--tree` and `--browse` (pure manifest views) |
+| `commands.py` | the top-level operations (backup, status, advice, restore, dedupe) |
+| `cli.py` | argument parsing, the single-instance lock, dispatch |
+
+Rule of thumb: `commands.py` orchestrates, everything else does one job and
+never imports it back (no import cycles: util ← config/manifest ← scanner/
+chunks/proton ← viewer/commands ← cli).
+
 ## Concurrency & robustness
 
 - A `flock` on `<backup_dir>/.lock` guarantees a manual run and the launchd

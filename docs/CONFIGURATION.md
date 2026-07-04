@@ -33,6 +33,7 @@ default. Paths may use `~`.
 | `remote_folder` | Proton Drive folder receiving the chunks + manifest (the full path is created on first run). Proton paths must live inside a namespace root such as `/my-files`; a path without one (e.g. `/Backups/Mac`) is automatically anchored as `/my-files/Backups/Mac`. |
 | `chunk_mb` | Target chunk size in MB. Files are first-fit packed up to this cap; a **file larger than the cap gets its own dedicated chunk** — it is never split. Bigger chunks = fewer remote files but more data to re-upload per change and to download per restore. |
 | `keep_local_chunks` | `false` (default): local chunk zips are deleted once uploaded — Proton Drive is the only copy and disk space is freed. `true`: keep local copies too (uses disk, but restores never download). |
+| `retire_sync_copies` | `true` (default): when dropped content is byte-identical to a file in a synced area, the sync-area original is moved to the Trash once the archive copy is confirmed uploaded — no duplicates. `false`: the dropzone never touches files inside sync dirs. |
 | `min_free_gb` | Safety margin: a backup aborts (with a notification) if building its chunks would leave less than this much free disk space. |
 | `exclude` | Glob patterns matched against file **and directory names** (not full paths). Matching items are ignored everywhere: sync dirs, dropzone, and `--advice` scans. The defaults skip regenerable dev artifacts (virtualenvs, `node_modules`, caches); `.git` is deliberately *not* excluded, since unpushed history is irreplaceable. |
 
@@ -53,13 +54,13 @@ remote folder. The sets must use different `backup_dir` values.
 - Name collisions with already-archived content get a timestamp suffix
   (`report.pdf` → `report_20260704_213000.pdf`) so nothing is overwritten.
 - A dropped folder is only trashed when **every** file inside it is uploaded.
-- **No duplicates on archive**: if the dropped content is byte-identical to a
-  file in a synced area (i.e. it was *copied* there), the sync-area original
-  is also moved to the Trash once the archive copy is confirmed uploaded —
-  only the archived copy stays. Content that is already archived under
-  another name is never stored twice; the dropped file is simply trashed
-  once its existing chunk is confirmed. A sync copy that changed since its
-  backup is never touched.
+- **No duplicates on archive** (`retire_sync_copies`, on by default): if the
+  dropped content is byte-identical to a file in a synced area (i.e. it was
+  *copied* there), the sync-area original is also moved to the Trash once
+  the archive copy is confirmed uploaded — only the archived copy stays.
+  Content that is already archived under another name is never stored twice;
+  the dropped file is simply trashed once its existing chunk is confirmed.
+  A sync copy that changed since its backup is never touched.
 
 ## Large files (videos, disk images, …)
 
