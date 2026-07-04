@@ -53,6 +53,14 @@ STORED_SUFFIXES = {
 QUOTA_ERROR_RE = re.compile(r"quota|storage.*(full|exceed)|insufficient|not enough space", re.I)
 AUTH_ERROR_RE = re.compile(r"auth|login|session|unauthoriz|forbidden|credential|401|403", re.I)
 
+# The Proton Drive CLI only accepts paths inside one of its root namespaces
+# (`filesystem list /` shows them); a bare folder path like /Backups is
+# rejected with: Path "/Backups" not supported.
+PROTON_NAMESPACES = {
+    "my-files", "devices", "shared-by-me", "shared-with-me", "albums",
+    "photos", "photos-shared-by-me", "photos-shared-with-me",
+}
+
 log = logging.getLogger(APP_NAME)
 
 
@@ -66,7 +74,7 @@ DEFAULT_CONFIG = {
     "backup_dir": "~/Backups/BackupOrganizer",
     "manifest": "~/Backups/BackupOrganizer/manifest.json",
     "proton_cli": "/Users/alyz/developement/generalBin/proton-drive",
-    "remote_folder": "/Backups/MacBookAir",
+    "remote_folder": "/my-files/Backups/MacBookAir",
     "chunk_mb": 500,
     "keep_local_chunks": False,
     "min_free_gb": 2,
@@ -76,6 +84,20 @@ DEFAULT_CONFIG = {
 
 class ConfigError(Exception):
     pass
+
+
+def normalize_remote_folder(raw: str) -> str:
+    """Anchor the remote folder inside a Proton Drive namespace.
+
+    "/Backups/Mac" and "Backups/Mac" both become "/my-files/Backups/Mac";
+    a path that already names a namespace is kept as-is.
+    """
+    parts = [p for p in raw.strip("/").split("/") if p]
+    if not parts:
+        return "/my-files"
+    if parts[0] not in PROTON_NAMESPACES:
+        parts.insert(0, "my-files")
+    return "/" + "/".join(parts)
 
 
 @dataclass
@@ -112,7 +134,7 @@ class Config:
             backup_dir=Path(raw["backup_dir"]).expanduser(),
             manifest_path=Path(raw["manifest"]).expanduser(),
             proton_cli=str(raw["proton_cli"]),
-            remote_folder="/" + str(raw["remote_folder"]).strip("/"),
+            remote_folder=normalize_remote_folder(str(raw["remote_folder"])),
             chunk_mb=float(raw["chunk_mb"]),
             keep_local_chunks=bool(raw["keep_local_chunks"]),
             min_free_gb=float(raw["min_free_gb"]),
@@ -578,10 +600,14 @@ def proton(cfg: Config, *args: str, timeout: int = SUBPROCESS_TIMEOUT) -> subpro
 
 
 def ensure_remote_folder(cfg: Config) -> None:
-    """Create each component of remote_folder; 'already exists' is fine."""
+    """Create each component of remote_folder; 'already exists' is fine.
+
+    The first component is a namespace root (/my-files, ...) that always
+    exists and cannot be created, so folder creation starts below it.
+    """
     parts = [p for p in cfg.remote_folder.split("/") if p]
-    parent = "/"
-    for part in parts:
+    parent = "/" + parts[0]
+    for part in parts[1:]:
         proc = proton(cfg, "filesystem", "create-folder", parent, part)
         if proc.returncode != 0 and "exist" not in (proc.stderr + proc.stdout).lower():
             log.debug("create-folder %s/%s: %s", parent.rstrip("/"), part, proc.stderr.strip())
@@ -598,22 +624,28 @@ def upload_file(cfg: Config, local: Path) -> None:
         raise UploadError(classify_upload_error(output), output.strip()[:500] or "unknown error")
 
 
-def confirm_remote(cfg: Config, name: str, expect_size: int) -> bool:
-    """Best-effort check that the uploaded file exists remotely at the right
-    size. Returns False only on a *positive* size mismatch; an unreadable or
+def confirm_remote(cfg: Config, name: str, expect_size: int, expect_sha1: str) -> bool:
+    """Check the uploaded file's remote metadata against the local chunk.
+
+    `filesystem info -j` reports the plaintext size (claimedSize) and a SHA-1
+    digest claimed at upload time; both must match before the local copy may
+    be deleted. Returns False only on a *positive* mismatch; an unreadable or
     unparseable response is trusted (the upload already exited 0)."""
     try:
-        proc = proton(cfg, "--json", "filesystem", "info", cfg.remote_path(name))
+        proc = proton(cfg, "filesystem", "info", "-j", cfg.remote_path(name))
         if proc.returncode != 0:
             log.debug("Remote confirm of %s unavailable: %s", name, proc.stderr.strip())
             return True
         sizes: list[int] = []
+        sha1s: list[str] = []
 
         def collect(node) -> None:
             if isinstance(node, dict):
                 for k, v in node.items():
                     if "size" in k.lower() and isinstance(v, int):
                         sizes.append(v)
+                    elif k == "sha1" and isinstance(v, str):
+                        sha1s.append(v.lower())
                     collect(v)
             elif isinstance(node, list):
                 for v in node:
@@ -622,6 +654,9 @@ def confirm_remote(cfg: Config, name: str, expect_size: int) -> bool:
         collect(json.loads(proc.stdout))
         if sizes and expect_size not in sizes:
             log.error("Remote size mismatch for %s: local %d, remote %s", name, expect_size, sizes)
+            return False
+        if sha1s and expect_sha1 not in sha1s:
+            log.error("Remote SHA-1 mismatch for %s: local %s, remote %s", name, expect_sha1, sha1s)
             return False
         return True
     except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
@@ -658,9 +693,11 @@ def upload_pending(cfg: Config, manifest: Manifest,
             if meta["uploaded"] or not local.is_file():
                 continue
             log.info("Uploading %s (%s) ...", name, human_size(meta["size"]))
+            with open(local, "rb") as fh:
+                local_sha1 = hashlib.file_digest(fh, "sha1").hexdigest()
             upload_file(cfg, local)
-            if not confirm_remote(cfg, name, meta["size"]):
-                raise UploadError("error", f"remote size mismatch for {name}")
+            if not confirm_remote(cfg, name, meta["size"], local_sha1):
+                raise UploadError("error", f"remote verification failed for {name}")
             meta["uploaded"] = now_iso()
             uploaded += 1
             manifest.save()  # persist progress after every chunk
