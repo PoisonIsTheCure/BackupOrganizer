@@ -106,8 +106,10 @@ osacompile -o "Backup Status.app" "Backup Status.applescript"
 ```
 
 Double-clicking **Backup Status.app** shows the `--status` report in a native
-macOS dialog; its **Browse Files** button opens the interactive HTML backup
-browser. Keep the app in the project folder or drag it to your Desktop/Dock.
+macOS dialog with two action buttons: **Run Backup** kicks off a full backup
+in the background (a notification arrives when it finishes), and
+**Browse Files** opens the interactive HTML backup browser. Keep the app in
+the project folder or drag it to your Desktop/Dock.
 
 ## Daily background runs with launchd
 
