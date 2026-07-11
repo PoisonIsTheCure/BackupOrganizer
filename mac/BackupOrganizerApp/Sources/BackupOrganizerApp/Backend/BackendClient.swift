@@ -139,6 +139,16 @@ actor BackendClient {
         try await runJSON(["--json", "--no-notify", "retire-sync-twin"] + arcnames)
     }
 
+    /// Reconciles the local manifest against Proton Drive (cloud = ground
+    /// truth) — recovers/fixes sync entries by cross-checking the remote
+    /// listing against local files (no downloads), and confirms archive
+    /// chunks are still present at the right size. See
+    /// cmd_recalculate_manifest in commands.py. Can take a while on a large
+    /// sync tree (one `filesystem list` call per remote folder).
+    func recalculateManifest() async throws -> RecalculateManifestResult {
+        try await runJSON(["--json", "--no-notify", "recalculate-manifest"])
+    }
+
     /// Streams `run --json`'s NDJSON progress lines as they're printed —
     /// this is the only long-running command, so it's the only one that
     /// needs line-by-line streaming instead of run()'s buffer-then-decode.

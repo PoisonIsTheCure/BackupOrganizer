@@ -15,7 +15,8 @@ from .chunks import (build_chunk, check_free_space, pack_new_members,
 from .config import DEFAULT_CONFIG, Config
 from .manifest import Manifest
 from .proton import (UPLOAD_FAIL_MESSAGES, UploadError, download_chunk, download_file,
-                     proton, upload_pending, upload_sync_files)
+                     list_remote_tree, proton, remote_list, upload_pending,
+                     upload_sync_files)
 from .scanner import (DROPZONE_SETTLE_SECONDS, diff_sync_dirs, find_sync_twins,
                       scan_dropzone, walk_files)
 from .util import (APP_NAME, BackupError, human_size, log, move_to_trash, notify,
@@ -563,6 +564,126 @@ def cmd_retire_sync_twin(cfg: Config, archive_arcnames: list[str],
         for s in skipped:
             print(f"Skipped {s['archive_arcname']}: {s['reason']}", file=sys.stderr)
     return 1 if skipped and not retired else 0
+
+
+def cmd_recalculate_manifest(cfg: Config, json_out: bool = False) -> int:
+    """Reconcile the local manifest against what's actually on Proton Drive
+    — the cloud is treated as ground truth for "is this file really up
+    there," recovering from a lost/stale/wrong local manifest.
+
+    Sync side (deep): lists the whole remote Sync/ tree and cross-checks
+    every entry against local files — no downloads. A remote file with a
+    matching local original (by mapping its arcname's directory segment
+    back to a configured sync_dir) is fully recovered (hashed locally,
+    marked uploaded). A remote file with no local match is only reported,
+    not downloaded — bandwidth for the whole tree isn't spent by surprise;
+    see --restore to fetch a specific one if you want it back. A local
+    entry claiming "uploaded" that isn't actually on the remote is reset to
+    pending (the next `run` re-uploads it). Orphans no longer present on
+    the remote are dropped (nothing left to delete-remote).
+
+    Archive side (shallow): only confirms each chunk in manifest.chunks
+    still exists remotely at the right size — does not attempt to recover
+    a chunk's internal file list from scratch (that needs downloading and
+    opening the zip, out of scope here).
+    """
+    manifest = Manifest.load(cfg.manifest_path)
+
+    # ----- sync: deep reconciliation ---------------------------------------- #
+    remote_sync = list_remote_tree(cfg, cfg.remote_path("Sync"))
+    base_len = len(cfg.remote_folder.rstrip("/")) + 1
+    remote_by_arc = {path[base_len:]: meta for path, meta in remote_sync.items()}
+    sync_dir_by_basename = {d.name: d for d in cfg.sync_dirs}
+
+    newly_recovered: list[str] = []
+    confirmed_pending: list[str] = []
+    size_mismatch: list[str] = []
+    unmatched_no_local: list[str] = []
+
+    def recover_entry(arc: str, origin: Path) -> None:
+        st = origin.stat()
+        manifest.files[arc] = {
+            "size": st.st_size, "mtime_ns": st.st_mtime_ns, "sha256": sha256_file(origin),
+            "source": "sync", "origin": str(origin), "uploaded": now_iso(),
+        }
+
+    for arc, meta in remote_by_arc.items():
+        parts = arc.split("/")
+        if len(parts) < 3 or parts[0] != "Sync":
+            continue  # not a mirrored sync path we recognize
+        entry = manifest.files.get(arc)
+        if entry is not None and entry.get("source") == "sync":
+            if not entry.get("uploaded"):
+                origin = Path(entry["origin"])
+                if origin.is_file():
+                    recover_entry(arc, origin)
+                    confirmed_pending.append(arc)
+                else:
+                    unmatched_no_local.append(arc)
+            elif entry["size"] != meta["size"]:
+                size_mismatch.append(arc)
+                origin = Path(entry["origin"])
+                if origin.is_file():
+                    recover_entry(arc, origin)
+            continue
+        sync_dir = sync_dir_by_basename.get(parts[1])
+        origin = (sync_dir / "/".join(parts[2:])) if sync_dir else None
+        if origin is not None and origin.is_file():
+            recover_entry(arc, origin)
+            manifest.deleted_sync.pop(arc, None)
+            newly_recovered.append(arc)
+        else:
+            unmatched_no_local.append(arc)
+
+    stale_cleared = []
+    for arc, entry in manifest.files.items():
+        if entry.get("source") == "sync" and entry.get("uploaded") and arc not in remote_by_arc:
+            entry["uploaded"] = ""
+            stale_cleared.append(arc)
+
+    orphans_cleared = []
+    for arc in list(manifest.deleted_sync):
+        if arc not in remote_by_arc:
+            del manifest.deleted_sync[arc]
+            orphans_cleared.append(arc)
+
+    # ----- archive: shallow presence/size check ------------------------------ #
+    remote_top = {item["name"]: item["size"] for item in remote_list(cfg, cfg.remote_folder)
+                  if item["type"] != "folder"}
+    archive_confirmed: list[str] = []
+    archive_reset: list[str] = []
+    for name, meta in manifest.chunks.items():
+        if not meta.get("uploaded"):
+            continue
+        if remote_top.get(name) == meta["size"]:
+            archive_confirmed.append(name)
+        else:
+            meta["uploaded"] = ""
+            archive_reset.append(name)
+
+    manifest.save()
+    result = {
+        "sync": {
+            "remote_sync_files": len(remote_by_arc),
+            "newly_recovered": newly_recovered, "confirmed_pending": confirmed_pending,
+            "size_mismatch": size_mismatch, "unmatched_no_local": unmatched_no_local,
+            "stale_cleared": stale_cleared, "orphans_cleared": orphans_cleared,
+        },
+        "archive": {"confirmed": archive_confirmed, "reset_to_pending": archive_reset},
+    }
+    if json_out:
+        print(json.dumps(result))
+    else:
+        s = result["sync"]
+        print(f"Sync: {s['remote_sync_files']} file(s) on the cloud — "
+              f"{len(s['newly_recovered'])} recovered, {len(s['confirmed_pending'])} confirmed, "
+              f"{len(s['size_mismatch'])} size mismatch, {len(s['unmatched_no_local'])} unmatched "
+              f"(no local original), {len(s['stale_cleared'])} reset to pending, "
+              f"{len(s['orphans_cleared'])} stale orphan(s) cleared.")
+        a = result["archive"]
+        print(f"Archive: {len(a['confirmed'])} chunk(s) confirmed, "
+              f"{len(a['reset_to_pending'])} reset to pending.")
+    return 0
 
 
 def cmd_dedupe(cfg: Config, min_mb: float, notify_enabled: bool) -> int:

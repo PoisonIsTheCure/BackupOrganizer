@@ -9,8 +9,8 @@ from pathlib import Path
 
 from .commands import (cmd_add_sync, cmd_advice, cmd_archive, cmd_backup,
                        cmd_dedupe, cmd_delete_remote, cmd_init, cmd_list,
-                       cmd_log_tail, cmd_orphans, cmd_restore, cmd_retire_sync_twin,
-                       cmd_status)
+                       cmd_log_tail, cmd_orphans, cmd_recalculate_manifest,
+                       cmd_restore, cmd_retire_sync_twin, cmd_status)
 from .config import DEFAULT_CONFIG_PATH, Config, ConfigError
 from .util import APP_NAME, BackupError, log, notify, setup_logging
 from .viewer import cmd_browse, cmd_tree
@@ -79,6 +79,9 @@ def build_parser() -> argparse.ArgumentParser:
         "retire-sync-twin",
         help="retire the synced copy of an already-archived file (local + cloud)")
     retire_p.add_argument("arcnames", nargs="+", metavar="ARCHIVE_ARCNAME")
+    sub.add_parser(
+        "recalculate-manifest",
+        help="reconcile the local manifest against what's actually on Proton Drive")
     return parser
 
 
@@ -147,6 +150,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_delete_remote(cfg, args.arcnames, json_out=args.json)
         if args.command == "retire-sync-twin":
             return cmd_retire_sync_twin(cfg, args.arcnames, json_out=args.json)
+        if args.command == "recalculate-manifest":
+            return cmd_recalculate_manifest(cfg, json_out=args.json)
         # bare invocation or explicit `run`: the full cycle
         return cmd_backup(cfg, do_upload=not args.no_upload,
                           dry_run=args.dry_run, notify_enabled=notify_enabled,

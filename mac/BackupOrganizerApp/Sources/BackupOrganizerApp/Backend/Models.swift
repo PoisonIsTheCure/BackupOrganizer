@@ -219,3 +219,43 @@ struct AddSyncResult: Codable, Equatable {
         case backupExitCode = "backup_exit_code"
     }
 }
+
+/// Result of `recalculate-manifest --json`: reconciling the local manifest
+/// against what's actually on Proton Drive (cloud = ground truth). See
+/// cmd_recalculate_manifest in commands.py for exactly what each category
+/// means and why sync is deep (cross-checked against local files, no
+/// downloads) while archive is shallow (presence/size only).
+struct RecalculateSyncResult: Codable, Equatable {
+    var remoteSyncFiles: Int
+    var newlyRecovered: [String]
+    var confirmedPending: [String]
+    var sizeMismatch: [String]
+    var unmatchedNoLocal: [String]
+    var staleCleared: [String]
+    var orphansCleared: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case remoteSyncFiles = "remote_sync_files"
+        case newlyRecovered = "newly_recovered"
+        case confirmedPending = "confirmed_pending"
+        case sizeMismatch = "size_mismatch"
+        case unmatchedNoLocal = "unmatched_no_local"
+        case staleCleared = "stale_cleared"
+        case orphansCleared = "orphans_cleared"
+    }
+}
+
+struct RecalculateArchiveResult: Codable, Equatable {
+    var confirmed: [String]
+    var resetToPending: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case confirmed
+        case resetToPending = "reset_to_pending"
+    }
+}
+
+struct RecalculateManifestResult: Codable, Equatable {
+    var sync: RecalculateSyncResult
+    var archive: RecalculateArchiveResult
+}

@@ -12,12 +12,21 @@ struct ActivityView: View {
     @ObservedObject private var activityLog = ActivityLog.shared
     @State private var logTailState: LoadState<LogTail> = .loading
 
+    @State private var showRecalculateConfirm = false
+    @State private var isRecalculating = false
+    @State private var recalculateResult: RecalculateManifestResult?
+    @State private var recalculateError: String?
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             header
             Divider()
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
+                    if isRecalculating || recalculateResult != nil {
+                        recalculatePanel
+                        Divider()
+                    }
                     appCommandsSection
                     Divider()
                     backendLogSection
@@ -26,12 +35,40 @@ struct ActivityView: View {
             }
         }
         .task { await loadLogTail() }
+        .confirmationDialog(
+            "Recalculate the remote manifest?",
+            isPresented: $showRecalculateConfirm
+        ) {
+            Button("Recalculate", role: .destructive) {
+                Task { await recalculateManifest() }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Cross-checks the synced-file manifest against what's actually on Proton Drive "
+                + "and reconciles it: recovers entries the local manifest lost track of, resets "
+                + "entries wrongly marked uploaded, and clears stale orphans. Archive chunks are "
+                + "only checked for presence, not rebuilt. This only rewrites local bookkeeping "
+                + "(manifest.json) — no files are uploaded, downloaded, or deleted.")
+        }
+        .alert("Recalculate failed", isPresented: Binding(
+            get: { recalculateError != nil }, set: { if !$0 { recalculateError = nil } }
+        )) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(recalculateError ?? "")
+        }
     }
 
     private var header: some View {
         HStack {
             Text("Activity").font(.title2.bold())
             Spacer()
+            Button {
+                showRecalculateConfirm = true
+            } label: {
+                Label("Recalculate Remote Manifest", systemImage: "arrow.triangle.2.circlepath.circle")
+            }
+            .disabled(isRecalculating)
             Button(role: .destructive) {
                 activityLog.clear()
             } label: {
@@ -45,6 +82,57 @@ struct ActivityView: View {
             }
         }
         .padding()
+    }
+
+    // MARK: - Recalculate
+
+    @ViewBuilder
+    private var recalculatePanel: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Remote Manifest Check").font(.headline)
+            if isRecalculating {
+                HStack {
+                    ProgressView().controlSize(.small)
+                    Text("Listing the remote tree and cross-checking against local files…")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            } else if let result = recalculateResult {
+                let s = result.sync
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Sync: \(s.remoteSyncFiles) file(s) on the cloud")
+                        .font(.caption.bold())
+                    recalculateRow("Recovered", s.newlyRecovered.count, .green)
+                    recalculateRow("Confirmed pending → uploaded", s.confirmedPending.count, .green)
+                    recalculateRow("Size mismatch (re-verified)", s.sizeMismatch.count, .orange)
+                    recalculateRow("Found on cloud, no local match", s.unmatchedNoLocal.count, .orange)
+                    recalculateRow("Reset to pending (not actually on cloud)", s.staleCleared.count, .orange)
+                    recalculateRow("Stale orphans cleared", s.orphansCleared.count, .secondary)
+                    Text("Archive: \(result.archive.confirmed.count) confirmed, "
+                        + "\(result.archive.resetToPending.count) reset to pending")
+                        .font(.caption.bold()).padding(.top, 4)
+                }
+            }
+        }
+    }
+
+    private func recalculateRow(_ label: String, _ count: Int, _ color: Color) -> some View {
+        HStack {
+            Text(label).font(.caption)
+            Spacer()
+            Text("\(count)").font(.caption.monospacedDigit().bold())
+                .foregroundStyle(count > 0 ? color : .secondary)
+        }
+    }
+
+    private func recalculateManifest() async {
+        isRecalculating = true
+        recalculateResult = nil
+        do {
+            recalculateResult = try await client.recalculateManifest()
+        } catch {
+            recalculateError = error.localizedDescription
+        }
+        isRecalculating = false
     }
 
     // MARK: - App Commands

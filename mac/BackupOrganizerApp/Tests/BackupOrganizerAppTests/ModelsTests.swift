@@ -105,6 +105,22 @@ final class ModelsTests: XCTestCase {
         XCTAssertEqual(result.skipped.first?.reason, "sync copy changed since archiving")
     }
 
+    func testDecodeRecalculateManifestResult() throws {
+        let json = """
+        {"sync": {"remote_sync_files": 5, "newly_recovered": ["Sync/a.txt"],
+                  "confirmed_pending": ["Sync/b.txt"], "size_mismatch": [],
+                  "unmatched_no_local": ["Sync/c.txt"], "stale_cleared": ["Sync/d.txt"],
+                  "orphans_cleared": ["Sync/e.txt"]},
+         "archive": {"confirmed": ["arch-00001.zip"], "reset_to_pending": ["arch-00002.zip"]}}
+        """
+        let result = try JSONDecoder().decode(RecalculateManifestResult.self, from: Data(json.utf8))
+        XCTAssertEqual(result.sync.remoteSyncFiles, 5)
+        XCTAssertEqual(result.sync.newlyRecovered, ["Sync/a.txt"])
+        XCTAssertEqual(result.sync.unmatchedNoLocal, ["Sync/c.txt"])
+        XCTAssertEqual(result.archive.confirmed, ["arch-00001.zip"])
+        XCTAssertEqual(result.archive.resetToPending, ["arch-00002.zip"])
+    }
+
     /// One NDJSON line per event kind cmd_backup's json_out path can emit
     /// (see commands.py's cmd_backup) — every line must decode and every
     /// event-specific field must round-trip.

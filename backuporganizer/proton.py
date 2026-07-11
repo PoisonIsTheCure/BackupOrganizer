@@ -52,6 +52,53 @@ def proton(cfg: Config, *args: str, timeout: int = SUBPROCESS_TIMEOUT) -> subpro
     )
 
 
+def _parse_list_items(stdout: str) -> list[dict]:
+    """Normalizes `filesystem list -j` output into [{name, type, size, sha1}].
+    Items whose name couldn't be decrypted (name.ok == False) are skipped —
+    there's nothing usable to reconcile them against."""
+    try:
+        raw = json.loads(stdout)
+    except json.JSONDecodeError:
+        return []
+    items: list[dict] = []
+    for node in raw if isinstance(raw, list) else []:
+        name_field = node.get("name", {})
+        if not name_field.get("ok") or not name_field.get("value"):
+            continue
+        rev_field = node.get("activeRevision", {})
+        rev = rev_field.get("value", {}) if rev_field.get("ok") else {}
+        items.append({
+            "name": name_field["value"],
+            "type": node.get("type"),
+            "size": rev.get("claimedSize", node.get("totalStorageSize", 0)),
+            "sha1": rev.get("claimedDigests", {}).get("sha1", ""),
+        })
+    return items
+
+
+def remote_list(cfg: Config, path: str) -> list[dict]:
+    """One level of `filesystem list -j path`: [] if the path doesn't exist
+    or listing otherwise fails (e.g. nothing uploaded there yet)."""
+    proc = proton(cfg, "filesystem", "list", "-j", path)
+    if proc.returncode != 0:
+        return []
+    return _parse_list_items(proc.stdout)
+
+
+def list_remote_tree(cfg: Config, path: str) -> dict[str, dict]:
+    """Recursively lists path, returning {full_remote_path: {size, sha1}}
+    for every file found below it (folders are walked, not included in the
+    result). One `filesystem list` call per folder, not per file."""
+    files: dict[str, dict] = {}
+    for item in remote_list(cfg, path):
+        item_path = f"{path.rstrip('/')}/{item['name']}"
+        if item["type"] == "folder":
+            files.update(list_remote_tree(cfg, item_path))
+        else:
+            files[item_path] = {"size": item["size"], "sha1": item["sha1"]}
+    return files
+
+
 def ensure_remote_folder(cfg: Config) -> None:
     """Create each component of remote_folder; 'already exists' is fine.
 
