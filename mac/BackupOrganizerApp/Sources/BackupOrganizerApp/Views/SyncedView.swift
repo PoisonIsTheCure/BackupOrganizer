@@ -57,7 +57,7 @@ struct SyncedView: View {
                     HStack {
                         VStack(alignment: .leading) {
                             Text(orphan.arcname).font(.body.monospaced())
-                            Text("deleted locally \(orphan.deletedAt) · \(humanSize(orphan.size))")
+                            Text("deleted locally \(humanTimestamp(orphan.deletedAt)) · \(humanSize(orphan.size))")
                                 .font(.caption).foregroundStyle(.secondary)
                         }
                         Spacer()
@@ -90,14 +90,8 @@ struct SyncedView: View {
             Section("Synced files (\(files.count))") {
                 if files.isEmpty {
                     Text("Nothing synced yet.").foregroundStyle(.secondary)
-                }
-                ForEach(files) { file in
-                    HStack {
-                        VStack(alignment: .leading) {
-                            Text(file.arcname).font(.body.monospaced())
-                            Text(humanSize(file.size)).font(.caption).foregroundStyle(.secondary)
-                        }
-                        Spacer()
+                } else {
+                    FileTreeView(root: buildFileTree(files)) { file in
                         UploadBadge(uploaded: file.isUploaded)
                     }
                 }

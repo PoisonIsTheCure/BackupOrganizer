@@ -133,4 +133,25 @@ final class ModelsTests: XCTestCase {
             check(event)
         }
     }
+
+    func testDecodeLogTail() throws {
+        let json = """
+        {"path": "/Users/you/Backups/BackupOrganizer/backup_organizer.log",
+         "lines": ["2026-07-11 20:02:41,449 INFO    Diff: 3797 added, 0 changed"]}
+        """
+        let tail = try JSONDecoder().decode(LogTail.self, from: Data(json.utf8))
+        XCTAssertTrue(tail.path.hasSuffix("backup_organizer.log"))
+        XCTAssertEqual(tail.lines.count, 1)
+    }
+
+    func testDecodeStatusInfoWithLogPath() throws {
+        let json = """
+        {"files_total": 0, "sync_count": 0, "archive_count": 0, "total_bytes": 0,
+         "chunks_total": 0, "chunks_pending": [], "sync_pending": 0, "orphans_pending": 0,
+         "local_cache_bytes": 0, "last_backup": "", "last_upload": "", "dropzone_pending": 0,
+         "remote_folder": "/my-files/x", "log_path": "/Users/you/Backups/BackupOrganizer/backup_organizer.log"}
+        """
+        let status = try JSONDecoder().decode(StatusInfo.self, from: Data(json.utf8))
+        XCTAssertEqual(status.logPath, "/Users/you/Backups/BackupOrganizer/backup_organizer.log")
+    }
 }

@@ -9,7 +9,8 @@ from pathlib import Path
 
 from .commands import (cmd_add_sync, cmd_advice, cmd_archive, cmd_backup,
                        cmd_dedupe, cmd_delete_remote, cmd_init, cmd_list,
-                       cmd_orphans, cmd_restore, cmd_retire_sync_twin, cmd_status)
+                       cmd_log_tail, cmd_orphans, cmd_restore, cmd_retire_sync_twin,
+                       cmd_status)
 from .config import DEFAULT_CONFIG_PATH, Config, ConfigError
 from .util import APP_NAME, BackupError, log, notify, setup_logging
 from .viewer import cmd_browse, cmd_tree
@@ -32,6 +33,8 @@ def build_parser() -> argparse.ArgumentParser:
                         help="list backed-up files (sync, archive, or all)")
     parser.add_argument("--orphans", action="store_true",
                         help="list synced files deleted locally but still in the cloud")
+    parser.add_argument("--log-tail", metavar="N", nargs="?", const=200, type=int,
+                        help="print the last N lines of backup_organizer.log (default: 200)")
     parser.add_argument("--advice", metavar="DIR", type=Path,
                         help="report files in DIR that are safely backed up")
     parser.add_argument("--tree", metavar="PREFIX", nargs="?", const="",
@@ -103,6 +106,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_list(cfg, args.list, json_out=args.json)
     if args.orphans:
         return cmd_orphans(cfg, json_out=args.json)
+    if args.log_tail is not None:
+        return cmd_log_tail(cfg, args.log_tail, json_out=args.json)
     if args.tree is not None:
         return cmd_tree(cfg, args.tree)
     if args.browse is not None:

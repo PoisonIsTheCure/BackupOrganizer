@@ -15,6 +15,7 @@ struct StatusInfo: Codable, Equatable {
     var lastUpload: String
     var dropzonePending: Int
     var remoteFolder: String
+    var logPath: String?
 
     enum CodingKeys: String, CodingKey {
         case filesTotal = "files_total"
@@ -30,6 +31,7 @@ struct StatusInfo: Codable, Equatable {
         case lastUpload = "last_upload"
         case dropzonePending = "dropzone_pending"
         case remoteFolder = "remote_folder"
+        case logPath = "log_path"
     }
 }
 
@@ -196,6 +198,12 @@ struct ProgressEvent: Codable, Equatable {
     }
 
     var isTerminal: Bool { event == "result" }
+}
+
+/// Result of `--log-tail N --json`: the tail of backup_organizer.log.
+struct LogTail: Codable, Equatable {
+    var path: String
+    var lines: [String]
 }
 
 /// Result of `add-sync DIR... --json`.

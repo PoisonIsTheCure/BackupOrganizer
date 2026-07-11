@@ -221,6 +221,7 @@ def cmd_status(cfg: Config, json_out: bool = False) -> int:
             "local_cache_bytes": local_bytes, "last_backup": manifest.last_backup,
             "last_upload": manifest.last_upload, "dropzone_pending": pending,
             "remote_folder": cfg.remote_folder,
+            "log_path": str(cfg.backup_dir / "backup_organizer.log"),
         }))
         return 0
 
@@ -239,6 +240,30 @@ def cmd_status(cfg: Config, json_out: bool = False) -> int:
         f"Orphaned in cloud:  {len(manifest.deleted_sync)} item(s) (see --orphans)",
     ]
     print("\n".join(lines))
+    return 0
+
+
+def cmd_log_tail(cfg: Config, n: int, json_out: bool = False) -> int:
+    """Print the last n lines of backup_organizer.log — the rotating log
+    every command writes INFO+ to (see util.setup_logging). This is the
+    only place upload failures, unexpected exceptions, and every diff are
+    recorded; --status/--list only ever show current state, not history.
+    """
+    log_path = cfg.backup_dir / "backup_organizer.log"
+    if not log_path.is_file():
+        if json_out:
+            print(json.dumps({"path": str(log_path), "lines": []}))
+        else:
+            print(f"No log file yet: {log_path}")
+        return 1
+    all_lines = log_path.read_text(errors="replace").splitlines()
+    tail = all_lines[-n:] if n > 0 else all_lines
+    if json_out:
+        print(json.dumps({"path": str(log_path), "lines": tail}))
+        return 0
+    print(f"# {log_path} (last {len(tail)} of {len(all_lines)} lines)")
+    for line in tail:
+        print(line)
     return 0
 
 

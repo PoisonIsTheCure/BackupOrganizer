@@ -4,6 +4,7 @@ enum SidebarItem: String, CaseIterable, Identifiable {
     case dashboard = "Dashboard"
     case synced = "Synced"
     case archived = "Archived"
+    case activity = "Activity"
 
     var id: String { rawValue }
 
@@ -12,6 +13,7 @@ enum SidebarItem: String, CaseIterable, Identifiable {
         case .dashboard: return "gauge"
         case .synced: return "arrow.triangle.2.circlepath"
         case .archived: return "archivebox"
+        case .activity: return "terminal"
         }
     }
 }
@@ -31,6 +33,7 @@ struct RootView: View {
             case .dashboard: DashboardView(client: client)
             case .synced: SyncedView(client: client)
             case .archived: ArchivedView(client: client)
+            case .activity: ActivityView(client: client)
             }
         }
         .frame(minWidth: 760, minHeight: 480)

@@ -48,37 +48,37 @@ struct ArchivedView: View {
             ErrorBanner(message: message) { Task { await load() } }
                 .padding()
         case .loaded(let files):
-            List(files) { file in
-                HStack {
-                    VStack(alignment: .leading) {
-                        Text(file.arcname).font(.body.monospaced())
-                        Text("\(humanSize(file.size)) · \(file.chunk ?? "?")")
-                            .font(.caption).foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    if file.relocatable == true {
-                        if retiringArcname == file.arcname {
-                            ProgressView().controlSize(.small)
-                        } else {
-                            Button("Retire Synced Copy") {
-                                retirePrompt = RetireSyncPrompt(
-                                    archiveArcnames: [file.arcname],
-                                    summaryLines: [file.arcname])
-                            }
-                            .disabled(file.twinConfirmed != true || retiringArcname != nil)
-                            .help(file.twinConfirmed == true
-                                  ? "Remove the synced copy of this file, keeping only the archive."
-                                  : "Waiting for the archive copy's upload to be confirmed first.")
-                        }
-                    }
-                    UploadBadge(uploaded: file.isUploaded)
-                }
-            }
-            .listStyle(.inset)
             if files.isEmpty {
                 Text("Nothing archived yet.")
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                List {
+                    FileTreeView(root: buildFileTree(files)) { file in
+                        retireButton(for: file)
+                        UploadBadge(uploaded: file.isUploaded)
+                    }
+                }
+                .listStyle(.inset)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func retireButton(for file: FileEntry) -> some View {
+        if file.relocatable == true {
+            if retiringArcname == file.arcname {
+                ProgressView().controlSize(.small)
+            } else {
+                Button("Retire Synced Copy") {
+                    retirePrompt = RetireSyncPrompt(
+                        archiveArcnames: [file.arcname],
+                        summaryLines: [file.arcname])
+                }
+                .disabled(file.twinConfirmed != true || retiringArcname != nil)
+                .help(file.twinConfirmed == true
+                      ? "Remove the synced copy of this file, keeping only the archive."
+                      : "Waiting for the archive copy's upload to be confirmed first.")
             }
         }
     }

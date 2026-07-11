@@ -19,20 +19,28 @@ actor BackendClient {
     // MARK: - Process plumbing
 
     /// Runs the CLI with `args`, returns raw stdout. Throws on launch
-    /// failure or a non-zero exit with no usable stdout at all.
+    /// failure or a non-zero exit with no usable stdout at all. Every call
+    /// — success or failure — is recorded to ActivityLog so the app always
+    /// shows what it actually ran, matching the exact argv (config path
+    /// included) that would reproduce it from a terminal.
     private func run(_ args: [String]) async throws -> (stdout: Data, stderr: String, exitCode: Int32) {
         let cliPath = await settings.cliPath
-        guard FileManager.default.isExecutableFile(atPath: cliPath) else {
-            throw BackendError.cliNotFound(cliPath)
-        }
         let configPath = await settings.configPathOverride
-
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: cliPath)
         var fullArgs = args
         if let configPath, !configPath.isEmpty {
             fullArgs = ["--config", configPath] + fullArgs
         }
+        let displayCommand = (["backup-organizer"] + fullArgs).joined(separator: " ")
+
+        guard FileManager.default.isExecutableFile(atPath: cliPath) else {
+            let message = "CLI not found or not executable at \(cliPath)"
+            await ActivityLog.shared.record(command: displayCommand, exitCode: nil,
+                                            stdout: "", stderr: "", launchError: message)
+            throw BackendError.cliNotFound(cliPath)
+        }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: cliPath)
         process.arguments = fullArgs
 
         let stdoutPipe = Pipe()
@@ -43,6 +51,9 @@ actor BackendClient {
         do {
             try process.run()
         } catch {
+            await ActivityLog.shared.record(command: displayCommand, exitCode: nil,
+                                            stdout: "", stderr: "",
+                                            launchError: error.localizedDescription)
             throw BackendError.launchFailed(error.localizedDescription)
         }
 
@@ -50,7 +61,10 @@ actor BackendClient {
         let stderrData = try stderrPipe.fileHandleForReading.readToEndCompat()
         process.waitUntilExit()
 
+        let stdoutText = String(data: stdoutData, encoding: .utf8) ?? "<non-UTF8 output>"
         let stderrText = String(data: stderrData, encoding: .utf8) ?? ""
+        await ActivityLog.shared.record(command: displayCommand, exitCode: process.terminationStatus,
+                                        stdout: stdoutText, stderr: stderrText)
         return (stdoutData, stderrText, process.terminationStatus)
     }
 
@@ -136,56 +150,80 @@ actor BackendClient {
     func runBackup(dryRun: Bool = false, noUpload: Bool = false) -> AsyncThrowingStream<ProgressEvent, Error> {
         AsyncThrowingStream { continuation in
             Task {
+                let cliPath = await settings.cliPath
+                let configPath = await settings.configPathOverride
+                var args = ["--json", "--no-notify"]
+                if dryRun { args.append("--dry-run") }
+                if noUpload { args.append("--no-upload") }
+                if let configPath, !configPath.isEmpty {
+                    args = ["--config", configPath] + args
+                }
+                args.append("run")
+                let displayCommand = (["backup-organizer"] + args).joined(separator: " ")
+
+                guard FileManager.default.isExecutableFile(atPath: cliPath) else {
+                    let message = "CLI not found or not executable at \(cliPath)"
+                    await ActivityLog.shared.record(command: displayCommand, exitCode: nil,
+                                                    stdout: "", stderr: "", launchError: message)
+                    continuation.finish(throwing: BackendError.cliNotFound(cliPath))
+                    return
+                }
+
+                let process = Process()
+                process.executableURL = URL(fileURLWithPath: cliPath)
+                process.arguments = args
+
+                let stdoutPipe = Pipe()
+                let stderrPipe = Pipe()
+                process.standardOutput = stdoutPipe
+                process.standardError = stderrPipe
+
+                var capturedLines: [String] = []
                 do {
-                    let cliPath = await settings.cliPath
-                    guard FileManager.default.isExecutableFile(atPath: cliPath) else {
-                        continuation.finish(throwing: BackendError.cliNotFound(cliPath))
-                        return
-                    }
-                    let configPath = await settings.configPathOverride
-
-                    let process = Process()
-                    process.executableURL = URL(fileURLWithPath: cliPath)
-                    var args = ["--json", "--no-notify"]
-                    if dryRun { args.append("--dry-run") }
-                    if noUpload { args.append("--no-upload") }
-                    if let configPath, !configPath.isEmpty {
-                        args = ["--config", configPath] + args
-                    }
-                    args.append("run")
-                    process.arguments = args
-
-                    let stdoutPipe = Pipe()
-                    let stderrPipe = Pipe()
-                    process.standardOutput = stdoutPipe
-                    process.standardError = stderrPipe
-
                     try process.run()
 
                     var sawResult = false
                     let decoder = JSONDecoder()
                     for try await line in stdoutPipe.fileHandleForReading.bytes.lines {
-                        guard !line.isEmpty, let data = line.data(using: .utf8) else { continue }
-                        guard let event = try? decoder.decode(ProgressEvent.self, from: data) else { continue }
+                        guard !line.isEmpty else { continue }
+                        capturedLines.append(line)
+                        guard let data = line.data(using: .utf8),
+                              let event = try? decoder.decode(ProgressEvent.self, from: data) else { continue }
                         continuation.yield(event)
                         if event.isTerminal { sawResult = true }
                     }
 
                     let stderrData = try stderrPipe.fileHandleForReading.readToEndCompat()
                     process.waitUntilExit()
+                    let stderrText = String(data: stderrData, encoding: .utf8) ?? ""
+
+                    await ActivityLog.shared.record(command: displayCommand,
+                                                    exitCode: process.terminationStatus,
+                                                    stdout: capturedLines.joined(separator: "\n"),
+                                                    stderr: stderrText)
 
                     if sawResult {
                         continuation.finish()
                     } else {
-                        let stderrText = String(data: stderrData, encoding: .utf8) ?? ""
                         continuation.finish(throwing: BackendError.nonZeroExit(
                             code: process.terminationStatus, stderr: stderrText))
                     }
                 } catch {
+                    await ActivityLog.shared.record(command: displayCommand, exitCode: nil,
+                                                    stdout: capturedLines.joined(separator: "\n"),
+                                                    stderr: "", launchError: error.localizedDescription)
                     continuation.finish(throwing: error)
                 }
             }
         }
+    }
+
+    /// Tail of backup_organizer.log — the Python side's own rotating log,
+    /// which records history (past runs, exceptions) that ActivityLog
+    /// (this app's own invocation history) doesn't have, since ActivityLog
+    /// only exists from when the app was launched.
+    func logTail(lines: Int = 200) async throws -> LogTail {
+        try await runJSON(["--log-tail", String(lines), "--json", "--no-notify"])
     }
 }
 

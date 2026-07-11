@@ -95,8 +95,8 @@ struct DashboardView: View {
                         detail: "deleted locally, still remote")
                 StatTile(title: "Dropzone pending", value: "\(status.dropzonePending)")
                 StatTile(title: "Local chunk cache", value: humanSize(status.localCacheBytes))
-                StatTile(title: "Last backup", value: status.lastBackup.isEmpty ? "never" : status.lastBackup)
-                StatTile(title: "Last upload", value: status.lastUpload.isEmpty ? "never" : status.lastUpload)
+                StatTile(title: "Last backup", value: humanTimestamp(status.lastBackup))
+                StatTile(title: "Last upload", value: humanTimestamp(status.lastUpload))
             }
             .padding()
             Text("Remote: \(status.remoteFolder)")
