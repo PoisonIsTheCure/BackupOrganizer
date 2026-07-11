@@ -85,26 +85,20 @@ def diff_sync_dirs(cfg: Config, manifest: Manifest) -> SyncDiff:
 
 def scan_dropzone(cfg: Config, manifest: Manifest,
                   settle_seconds: int = DROPZONE_SETTLE_SECONDS) -> tuple[
-        list[Member], dict[Path, list[str]], dict[str, list[dict]]]:
+        list[Member], dict[Path, list[str]]]:
     """Collect dropzone files ready for archiving.
 
-    Returns (members, groups, relocations):
+    Returns (members, groups):
     - members: files to pack into new archive chunks this run.
     - groups maps top-level dropzone entries to the arcnames they contain, so
       an entry is only trashed once every file in it is confirmed uploaded.
-    - relocations maps a new archive arcname to the *sync* manifest entries
-      holding identical content: the dropped file was copied out of a synced
-      area, so once the archive copy is confirmed uploaded the sync-area
-      original is trashed too — only the archived copy stays, no duplicate.
-      (Only populated when cfg.retire_sync_copies is enabled.)
     Content already archived under another name is not stored twice: the
     dropped file just joins its group and is trashed once that chunk is up.
     """
     pending: list[Member] = []
     groups: dict[Path, list[str]] = {}
-    relocations: dict[str, list[dict]] = {}
     if not cfg.dropzone.is_dir():
-        return pending, groups, relocations
+        return pending, groups
 
     cutoff = datetime.datetime.now().timestamp() - settle_seconds
     existing_names = set(manifest.files)
@@ -132,18 +126,10 @@ def scan_dropzone(cfg: Config, manifest: Manifest,
             arcname = "Archive/" + path.relative_to(cfg.dropzone).as_posix()
             prior = manifest.files.get(arcname)
             matches = by_content.get(digest, [])
-            # Sync entries with identical content: the file was copied out of
-            # a synced area, so those originals are retired once the archive
-            # copy is confirmed uploaded — recorded on every path, because
-            # the confirmation may only happen on a later run.
-            sync_twins = ([dict(e) for a, e in matches if e["source"] == "sync"]
-                          if cfg.retire_sync_copies else [])
             if prior and prior["sha256"] == digest and safely_stored(prior):
                 # Identical content is already in a chunk (uploaded, or built
                 # and awaiting upload): don't archive it again.
                 group.append(arcname)
-                if sync_twins:
-                    relocations[arcname] = sync_twins
                 continue
             arch_twin = next(
                 (a for a, e in matches
@@ -154,8 +140,6 @@ def scan_dropzone(cfg: Config, manifest: Manifest,
                 log.info("Dropzone %s is already archived as %s; not storing it twice.",
                          path.name, arch_twin)
                 group.append(arch_twin)
-                if sync_twins:
-                    relocations[arch_twin] = sync_twins
                 continue
             if prior and prior["sha256"] != digest:
                 # Same name, different content: keep both by timestamping the new one.
@@ -164,11 +148,23 @@ def scan_dropzone(cfg: Config, manifest: Manifest,
                 arcname = f"{stem}_{stamp}.{ext}" if dot else f"{arcname}_{stamp}"
                 while arcname in existing_names:
                     arcname += "_1"
-            if sync_twins:
-                relocations[arcname] = sync_twins
             existing_names.add(arcname)
             pending.append(Member(arcname, path, st.st_size, st.st_mtime_ns,
                                   digest, source="dropzone"))
             group.append(arcname)
         groups[top] = group
-    return pending, groups, relocations
+    return pending, groups
+
+
+def find_sync_twins(manifest: Manifest, archive_arcname: str) -> list[tuple[str, dict]]:
+    """Live sync-source manifest entries with content identical to an
+    archived file — candidates for retiring the sync copy once the archive
+    copy is confirmed uploaded. Returns (sync_arcname, entry) pairs."""
+    entry = manifest.files.get(archive_arcname)
+    if not entry:
+        return []
+    digest = entry["sha256"]
+    return [
+        (arc, e) for arc, e in manifest.files.items()
+        if e["source"] == "sync" and e["sha256"] == digest
+    ]

@@ -32,10 +32,31 @@ default. Paths may use `~`.
 | `proton_cli` | Absolute path to the Proton Drive CLI binary. |
 | `remote_folder` | Proton Drive folder receiving the chunks + manifest (the full path is created on first run). Proton paths must live inside a namespace root such as `/my-files`; a path without one (e.g. `/Backups/Mac`) is automatically anchored as `/my-files/Backups/Mac`. |
 | `chunk_mb` | Target chunk size in MB. Files are first-fit packed up to this cap; a **file larger than the cap gets its own dedicated chunk** — it is never split. Bigger chunks = fewer remote files but more data to re-upload per change and to download per restore. |
-| `keep_local_chunks` | `false` (default): local chunk zips are deleted once uploaded — Proton Drive is the only copy and disk space is freed. `true`: keep local copies too (uses disk, but restores never download). |
-| `retire_sync_copies` | `true` (default): when dropped content is byte-identical to a file in a synced area, the sync-area original is moved to the Trash once the archive copy is confirmed uploaded — no duplicates. `false`: the dropzone never touches files inside sync dirs. |
-| `min_free_gb` | Safety margin: a backup aborts (with a notification) if building its chunks would leave less than this much free disk space. |
+| `keep_local_chunks` | `false` (default): local archive chunk zips are deleted once uploaded — Proton Drive is the only copy and disk space is freed. `true`: keep local copies too (uses disk, but restores never download). Sync files are never zipped, so this has no effect on them. |
+| `min_free_gb` | Safety margin: a backup aborts (with a notification) if building archive chunks would leave less than this much free disk space. Sync uploads stream straight from the original file and use no extra local disk, so they aren't covered by this check. |
 | `exclude` | Glob patterns matched against file **and directory names** (not full paths). Matching items are ignored everywhere: sync dirs, dropzone, and `--advice` scans. The defaults skip regenerable dev artifacts (virtualenvs, `node_modules`, caches); `.git` is deliberately *not* excluded, since unpushed history is irreplaceable. |
+
+## Synced folders
+
+Files under `sync_dirs` are uploaded as **plain files**, mirroring the exact
+local directory shape remotely under `Sync/<basename>/…` — no zipping. This
+is different from the dropzone/archive, which is chunked into zips (see
+below).
+
+**Deleting a synced file locally never deletes its cloud copy.** The next
+backup run notices the file is gone and marks it an *orphan* — still on
+Proton Drive, no longer tracked as a live local file. Orphans are listed with
+`--orphans` and only removed from the cloud with an explicit
+`delete-remote ARCNAME`. This is deliberate: local deletion (accidental or
+not) should never be able to destroy the only remaining copy of a file.
+
+To move a file from synced to archived and drop the redundant synced copy
+(local + cloud), archive it as usual, then once the archive copy is
+confirmed uploaded, run `retire-sync-twin ARCHIVE_ARCNAME` — it re-verifies
+the synced copy is still byte-identical, deletes it from the cloud, and
+moves the local original to the Trash. This is a deliberate, explicit
+action; nothing does this automatically (see the GUI, which prompts before
+calling it).
 
 ## Multiple configurations
 
@@ -54,13 +75,12 @@ remote folder. The sets must use different `backup_dir` values.
 - Name collisions with already-archived content get a timestamp suffix
   (`report.pdf` → `report_20260704_213000.pdf`) so nothing is overwritten.
 - A dropped folder is only trashed when **every** file inside it is uploaded.
-- **No duplicates on archive** (`retire_sync_copies`, on by default): if the
-  dropped content is byte-identical to a file in a synced area (i.e. it was
-  *copied* there), the sync-area original is also moved to the Trash once
-  the archive copy is confirmed uploaded — only the archived copy stays.
-  Content that is already archived under another name is never stored twice;
+- Content that is already archived under another name is never stored twice;
   the dropped file is simply trashed once its existing chunk is confirmed.
-  A sync copy that changed since its backup is never touched.
+- If the dropped content is byte-identical to a file in a synced area (i.e.
+  it was *copied* there rather than moved), the sync-area original is
+  **not** touched automatically — see "Synced folders" above for the
+  explicit `retire-sync-twin` step that drops the redundant sync copy.
 
 ## Large files (videos, disk images, …)
 

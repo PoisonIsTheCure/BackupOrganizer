@@ -26,10 +26,9 @@ STORED_SUFFIXES = {
 
 @dataclass
 class ChunkPlan:
-    """A chunk to build this run: its name, kind, and member files."""
+    """An archive chunk to build this run: its name and member files."""
 
     name: str
-    kind: str  # "sync" | "archive"
     members: list[Member]
 
     @property
@@ -38,9 +37,9 @@ class ChunkPlan:
         return sum(m.size for m in self.members)
 
 
-def pack_new_members(members: list[Member], kind: str, cfg: Config,
+def pack_new_members(members: list[Member], cfg: Config,
                      manifest: Manifest) -> list[ChunkPlan]:
-    """First-fit pack new files into chunks of at most chunk_cap bytes.
+    """First-fit pack new archive files into chunks of at most chunk_cap bytes.
 
     A file larger than the cap is never split: it gets a dedicated chunk of
     its own (one zip, one file), so a 4 GB video is one self-contained chunk.
@@ -50,47 +49,16 @@ def pack_new_members(members: list[Member], kind: str, cfg: Config,
     current_bytes = 0
     for m in sorted(members, key=lambda m: m.arcname):
         if m.size >= cfg.chunk_cap:
-            plans.append(ChunkPlan(manifest.new_chunk_name(kind), kind, [m]))
+            plans.append(ChunkPlan(manifest.new_chunk_name(), [m]))
             continue
         if current and current_bytes + m.size > cfg.chunk_cap:
-            plans.append(ChunkPlan(manifest.new_chunk_name(kind), kind, current))
+            plans.append(ChunkPlan(manifest.new_chunk_name(), current))
             current, current_bytes = [], 0
         current.append(m)
         current_bytes += m.size
     if current:
-        plans.append(ChunkPlan(manifest.new_chunk_name(kind), kind, current))
+        plans.append(ChunkPlan(manifest.new_chunk_name(), current))
     return plans
-
-
-def plan_rebuilds(cfg: Config, manifest: Manifest, deleted: list[str],
-                  changed: list[Member]) -> tuple[list[ChunkPlan], list[str]]:
-    """Plan rebuilds for sync chunks with a changed or deleted member.
-
-    Sync chunks are rebuilt entirely from the live local files, so updating a
-    chunk never requires downloading anything. Returns (rebuild plans, chunks
-    that end up empty and must be removed).
-    """
-    dirty: set[str] = set()
-    for arc in deleted:
-        dirty.add(manifest.files[arc]["chunk"])
-    changed_by_arc = {m.arcname: m for m in changed}
-    for m in changed:
-        dirty.add(manifest.files[m.arcname]["chunk"])
-
-    plans: list[ChunkPlan] = []
-    empty: list[str] = []
-    deleted_set = set(deleted)
-    for chunk_name in sorted(dirty):
-        members = [
-            changed_by_arc.get(arc) or Member.from_entry(arc, entry)
-            for arc, entry in manifest.files.items()
-            if entry.get("chunk") == chunk_name and arc not in deleted_set
-        ]
-        if members:
-            plans.append(ChunkPlan(chunk_name, "sync", members))
-        else:
-            empty.append(chunk_name)
-    return plans, empty
 
 
 def check_free_space(cfg: Config, needed_bytes: int) -> None:
@@ -124,17 +92,16 @@ def build_chunk(cfg: Config, plan: ChunkPlan) -> dict:
         if bad is not None:
             tmp.unlink(missing_ok=True)
             raise BackupError(f"Chunk {plan.name} failed its CRC check at {bad}.")
-        if plan.kind == "archive":
-            for m in plan.members:
-                if sha256_zip_entry(zf, m.arcname) != m.sha256:
-                    tmp.unlink(missing_ok=True)
-                    raise BackupError(
-                        f"Hash mismatch inside {plan.name} for {m.arcname}; "
-                        "the original was NOT touched."
-                    )
+        for m in plan.members:
+            if sha256_zip_entry(zf, m.arcname) != m.sha256:
+                tmp.unlink(missing_ok=True)
+                raise BackupError(
+                    f"Hash mismatch inside {plan.name} for {m.arcname}; "
+                    "the original was NOT touched."
+                )
     os.replace(tmp, path)
     return {
-        "kind": plan.kind,
+        "kind": "archive",
         "size": path.stat().st_size,
         "sha256": sha256_file(path),
         "files": len(plan.members),
@@ -142,32 +109,23 @@ def build_chunk(cfg: Config, plan: ChunkPlan) -> dict:
     }
 
 
-def reconcile_chunks(cfg: Config, manifest: Manifest) -> set[str]:
-    """Handle chunks that were built earlier but vanished before upload.
-
-    Sync chunks are simply rebuilt from the live files; archive chunks are
-    dropped from the manifest — their originals are still in the dropzone
-    (they are only trashed after a confirmed upload), so the next scan
-    re-archives them. Returns sync chunk names needing a rebuild.
+def reconcile_chunks(cfg: Config, manifest: Manifest) -> None:
+    """Drop archive chunks that were built earlier but vanished before
+    upload — their originals are still in the dropzone (only trashed after
+    a confirmed upload), so the next scan re-archives them.
     """
-    rebuild: set[str] = set()
     for name, meta in list(manifest.chunks.items()):
         if meta["uploaded"] or cfg.chunk_path(name).is_file():
             continue
-        if meta["kind"] == "sync":
-            log.warning("Chunk %s disappeared before upload; will rebuild.", name)
-            rebuild.add(name)
-        else:
-            log.warning(
-                "Archive chunk %s disappeared before upload; dropping it — "
-                "its originals are still in the dropzone and will be re-archived.",
-                name,
-            )
-            manifest.files = {
-                arc: e for arc, e in manifest.files.items() if e.get("chunk") != name
-            }
-            del manifest.chunks[name]
-    return rebuild
+        log.warning(
+            "Archive chunk %s disappeared before upload; dropping it — "
+            "its originals are still in the dropzone and will be re-archived.",
+            name,
+        )
+        manifest.files = {
+            arc: e for arc, e in manifest.files.items() if e.get("chunk") != name
+        }
+        del manifest.chunks[name]
 
 
 def repack_archive_chunk(cfg: Config, manifest: Manifest, chunk_name: str,

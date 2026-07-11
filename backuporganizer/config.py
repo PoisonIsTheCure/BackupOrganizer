@@ -26,7 +26,6 @@ DEFAULT_CONFIG = {
     "remote_folder": "/my-files/Backups/MacBookAir",
     "chunk_mb": 500,
     "keep_local_chunks": False,
-    "retire_sync_copies": True,
     "min_free_gb": 2,
     "exclude": [
         ".DS_Store", "*.tmp", "._*", ".localized",
@@ -67,7 +66,6 @@ class Config:
     remote_folder: str
     chunk_mb: float
     keep_local_chunks: bool
-    retire_sync_copies: bool
     min_free_gb: float
     exclude: list[str]
 
@@ -102,7 +100,6 @@ class Config:
             remote_folder=normalize_remote_folder(str(raw["remote_folder"])),
             chunk_mb=float(raw["chunk_mb"]),
             keep_local_chunks=bool(raw["keep_local_chunks"]),
-            retire_sync_copies=bool(raw["retire_sync_copies"]),
             min_free_gb=float(raw["min_free_gb"]),
             exclude=list(raw["exclude"]),
         )

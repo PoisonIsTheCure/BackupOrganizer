@@ -9,7 +9,7 @@ import subprocess
 from pathlib import Path
 
 from .config import Config
-from .manifest import Manifest
+from .manifest import Manifest, Member
 from .util import human_size, log, now_iso
 
 SUBPROCESS_TIMEOUT = 15 * 60
@@ -65,28 +65,65 @@ def ensure_remote_folder(cfg: Config) -> None:
         parent = parent.rstrip("/") + "/" + part
 
 
-def upload_file(cfg: Config, local: Path) -> None:
-    """Upload one file into remote_folder, replacing any previous version."""
+def ensure_remote_dirs(cfg: Config, manifest: Manifest, remote_dirs: set[str]) -> None:
+    """Create every ancestor folder of remote_dirs that isn't already known.
+
+    Folders are created top-down (a child's parent must exist first) and
+    every newly-created path is recorded in manifest.remote_dirs so later
+    runs skip it entirely instead of re-issuing create-folder calls for a
+    largely static sync tree.
+    """
+    known = set(manifest.remote_dirs) | {cfg.remote_folder}
+    needed: set[str] = set()
+    for d in remote_dirs:
+        parts = [p for p in d[len(cfg.remote_folder):].strip("/").split("/") if p]
+        parent = cfg.remote_folder
+        for part in parts:
+            parent = parent.rstrip("/") + "/" + part
+            needed.add(parent)
+    for path in sorted(needed - known, key=lambda p: p.count("/")):
+        parent, _, name = path.rpartition("/")
+        proc = proton(cfg, "filesystem", "create-folder", parent, name)
+        if proc.returncode != 0 and "exist" not in (proc.stderr + proc.stdout).lower():
+            log.debug("create-folder %s/%s: %s", parent, name, proc.stderr.strip())
+        manifest.remote_dirs.append(path)
+        known.add(path)
+
+
+def upload_file(cfg: Config, local: Path, remote_parent: str | None = None) -> None:
+    """Upload one file into remote_parent (default remote_folder), replacing
+    any previous version."""
     proc = proton(
         cfg, "filesystem", "upload", "-c", "replace", "-t",
-        str(local), cfg.remote_folder, timeout=TRANSFER_TIMEOUT,
+        str(local), remote_parent or cfg.remote_folder, timeout=TRANSFER_TIMEOUT,
     )
     if proc.returncode != 0:
         output = proc.stderr + proc.stdout
         raise UploadError(classify_upload_error(output), output.strip()[:500] or "unknown error")
 
 
-def confirm_remote(cfg: Config, name: str, expect_size: int, expect_sha1: str) -> bool:
-    """Check the uploaded file's remote metadata against the local chunk.
+def upload_files(cfg: Config, locals_: list[Path], remote_parent: str) -> None:
+    """Upload several files into the same remote_parent in one CLI call."""
+    proc = proton(
+        cfg, "filesystem", "upload", "-c", "replace", "-t",
+        *[str(p) for p in locals_], remote_parent, timeout=TRANSFER_TIMEOUT,
+    )
+    if proc.returncode != 0:
+        output = proc.stderr + proc.stdout
+        raise UploadError(classify_upload_error(output), output.strip()[:500] or "unknown error")
+
+
+def confirm_remote(cfg: Config, remote_path: str, expect_size: int, expect_sha1: str) -> bool:
+    """Check the uploaded file's remote metadata against the local copy.
 
     `filesystem info -j` reports the plaintext size (claimedSize) and a SHA-1
     digest claimed at upload time; both must match before the local copy may
     be deleted. Returns False only on a *positive* mismatch; an unreadable or
     unparseable response is trusted (the upload already exited 0)."""
     try:
-        proc = proton(cfg, "filesystem", "info", "-j", cfg.remote_path(name))
+        proc = proton(cfg, "filesystem", "info", "-j", remote_path)
         if proc.returncode != 0:
-            log.debug("Remote confirm of %s unavailable: %s", name, proc.stderr.strip())
+            log.debug("Remote confirm of %s unavailable: %s", remote_path, proc.stderr.strip())
             return True
         sizes: list[int] = []
         sha1s: list[str] = []
@@ -105,10 +142,10 @@ def confirm_remote(cfg: Config, name: str, expect_size: int, expect_sha1: str) -
 
         collect(json.loads(proc.stdout))
         if sizes and expect_size not in sizes:
-            log.error("Remote size mismatch for %s: local %d, remote %s", name, expect_size, sizes)
+            log.error("Remote size mismatch for %s: local %d, remote %s", remote_path, expect_size, sizes)
             return False
         if sha1s and expect_sha1 not in sha1s:
-            log.error("Remote SHA-1 mismatch for %s: local %s, remote %s", name, expect_sha1, sha1s)
+            log.error("Remote SHA-1 mismatch for %s: local %s, remote %s", remote_path, expect_sha1, sha1s)
             return False
         return True
     except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
@@ -125,6 +162,21 @@ def download_chunk(cfg: Config, name: str, dest_dir: Path) -> Path:
     if proc.returncode != 0 or not local.is_file():
         output = (proc.stderr + proc.stdout).strip()[:500]
         raise UploadError(classify_upload_error(output), f"download of {name} failed: {output}")
+    return local
+
+
+def download_file(cfg: Config, remote_path: str, dest_dir: Path) -> Path:
+    """Download one plain mirrored file (a synced file, not a chunk) into
+    dest_dir. Returns the downloaded path, named after the remote leaf name."""
+    proc = proton(
+        cfg, "filesystem", "download", "-c", "replace",
+        remote_path, str(dest_dir), timeout=TRANSFER_TIMEOUT,
+    )
+    leaf = remote_path.rstrip("/").rsplit("/", 1)[-1]
+    local = dest_dir / leaf
+    if proc.returncode != 0 or not local.is_file():
+        output = (proc.stderr + proc.stdout).strip()[:500]
+        raise UploadError(classify_upload_error(output), f"download of {remote_path} failed: {output}")
     return local
 
 
@@ -151,7 +203,7 @@ def upload_pending(cfg: Config, manifest: Manifest,
             with open(local, "rb") as fh:
                 local_sha1 = hashlib.file_digest(fh, "sha1").hexdigest()
             upload_file(cfg, local)
-            if not confirm_remote(cfg, name, meta["size"], local_sha1):
+            if not confirm_remote(cfg, cfg.remote_path(name), meta["size"], local_sha1):
                 raise UploadError("error", f"remote verification failed for {name}")
             meta["uploaded"] = now_iso()
             uploaded += 1
@@ -179,3 +231,53 @@ def upload_pending(cfg: Config, manifest: Manifest,
             error = UploadError("error", str(exc))
     manifest.save()
     return uploaded, freed, error
+
+
+def upload_sync_files(cfg: Config, manifest: Manifest) -> tuple[int, UploadError | None]:
+    """Upload every not-yet-uploaded sync file as a plain file, mirroring the
+    local directory shape remotely — no zipping, no chunk building, nothing
+    written to local disk beyond the manifest.
+
+    Scans manifest.files for source=="sync" entries with no `uploaded`
+    timestamp (same resumable pattern as upload_pending's chunk scan), groups
+    them by remote parent directory, and uploads each group in one CLI call,
+    then confirms each file individually (the CLI's `info` command takes
+    exactly one path). A failure stops the loop but keeps every
+    already-confirmed upload's manifest entry saved.
+    """
+    error: UploadError | None = None
+    uploaded = 0
+    members = [
+        Member.from_entry(arc, e)
+        for arc, e in manifest.files.items()
+        if e.get("source") == "sync" and not e.get("uploaded") and Path(e["origin"]).is_file()
+    ]
+    if not members:
+        return uploaded, error
+    try:
+        ensure_remote_folder(cfg)
+        groups: dict[str, list[Member]] = {}
+        for m in members:
+            parent = cfg.remote_path(m.arcname.rsplit("/", 1)[0]) if "/" in m.arcname \
+                else cfg.remote_folder
+            groups.setdefault(parent, []).append(m)
+        ensure_remote_dirs(cfg, manifest, set(groups))
+        for parent in sorted(groups):
+            group = groups[parent]
+            log.info("Uploading %d sync file(s) to %s ...", len(group), parent)
+            upload_files(cfg, [m.origin for m in group], parent)
+            for m in group:
+                with open(m.origin, "rb") as fh:
+                    local_sha1 = hashlib.file_digest(fh, "sha1").hexdigest()
+                remote_path = cfg.remote_path(m.arcname)
+                if not confirm_remote(cfg, remote_path, m.size, local_sha1):
+                    raise UploadError("error", f"remote verification failed for {m.arcname}")
+                manifest.files[m.arcname] = m.to_entry_sync(uploaded=now_iso())
+                uploaded += 1
+                manifest.save()  # persist progress after every file
+    except UploadError as exc:
+        error = exc
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        error = UploadError("error", str(exc))
+    manifest.save()
+    return uploaded, error

@@ -55,7 +55,8 @@ def cmd_tree(cfg: Config, prefix: str) -> int:
             (f"{name}/", f"[{human_size(sub['size'])}, {sub['count']} file(s)]")
             for name, sub in dirs
         ] + [
-            (name, f"({human_size(e['size'])}, {e['chunk']})")
+            (name, f"({human_size(e['size'])}, "
+                   f"{e['chunk'] if e['source'] == 'dropzone' else 'synced'})")
             for name, e in node["files"]
         ]
         for i, (label, info) in enumerate(entries):
@@ -189,9 +190,14 @@ def cmd_browse(cfg: Config, out: Path | None) -> int:
     if not manifest.files:
         print("Nothing backed up yet.")
         return 1
+    def chunk_and_uploaded(e: dict) -> tuple[str, str]:
+        if e["source"] == "dropzone":
+            chunk = e.get("chunk", "?")
+            return chunk, manifest.chunks.get(chunk, {}).get("uploaded", "")
+        return "synced", e.get("uploaded", "")
+
     data = [
-        [arc, e["size"], e.get("chunk", "?"),
-         manifest.chunks.get(e.get("chunk", ""), {}).get("uploaded", ""), e["source"]]
+        [arc, e["size"], *chunk_and_uploaded(e), e["source"]]
         for arc, e in sorted(manifest.files.items())
     ]
     total = sum(e["size"] for e in manifest.files.values())

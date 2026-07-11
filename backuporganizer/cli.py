@@ -8,7 +8,8 @@ import sys
 from pathlib import Path
 
 from .commands import (cmd_add_sync, cmd_advice, cmd_archive, cmd_backup,
-                       cmd_dedupe, cmd_init, cmd_restore, cmd_status)
+                       cmd_dedupe, cmd_delete_remote, cmd_init, cmd_list,
+                       cmd_orphans, cmd_restore, cmd_retire_sync_twin, cmd_status)
 from .config import DEFAULT_CONFIG_PATH, Config, ConfigError
 from .util import APP_NAME, BackupError, log, notify, setup_logging
 from .viewer import cmd_browse, cmd_tree
@@ -23,7 +24,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH,
                         help=f"config file (default: {DEFAULT_CONFIG_PATH})")
+    parser.add_argument("--json", action="store_true",
+                        help="emit machine-readable JSON (status/list/orphans/archive/add-sync)")
     parser.add_argument("--status", action="store_true", help="print backup summary and exit")
+    parser.add_argument("--list", metavar="KIND", nargs="?", const="all",
+                        choices=["sync", "archive", "all"],
+                        help="list backed-up files (sync, archive, or all)")
+    parser.add_argument("--orphans", action="store_true",
+                        help="list synced files deleted locally but still in the cloud")
     parser.add_argument("--advice", metavar="DIR", type=Path,
                         help="report files in DIR that are safely backed up")
     parser.add_argument("--tree", metavar="PREFIX", nargs="?", const="",
@@ -61,6 +69,13 @@ def build_parser() -> argparse.ArgumentParser:
     addsync_p.add_argument("dirs", nargs="+", type=Path, metavar="DIR")
     addsync_p.add_argument("--no-run", action="store_true",
                            help="only update the config; back up on the next run")
+    del_p = sub.add_parser(
+        "delete-remote", help="permanently delete the cloud copy of an orphaned synced file")
+    del_p.add_argument("arcnames", nargs="+", metavar="ARCNAME")
+    retire_p = sub.add_parser(
+        "retire-sync-twin",
+        help="retire the synced copy of an already-archived file (local + cloud)")
+    retire_p.add_argument("arcnames", nargs="+", metavar="ARCHIVE_ARCNAME")
     return parser
 
 
@@ -83,7 +98,11 @@ def main(argv: list[str] | None = None) -> int:
 
     # Read-only commands need no lock.
     if args.status:
-        return cmd_status(cfg)
+        return cmd_status(cfg, json_out=args.json)
+    if args.list is not None:
+        return cmd_list(cfg, args.list, json_out=args.json)
+    if args.orphans:
+        return cmd_orphans(cfg, json_out=args.json)
     if args.tree is not None:
         return cmd_tree(cfg, args.tree)
     if args.browse is not None:
@@ -110,15 +129,19 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "archive":
             return cmd_archive(cfg, args.paths, run=not args.no_run,
                                do_upload=not args.no_upload,
-                               notify_enabled=notify_enabled)
+                               notify_enabled=notify_enabled, json_out=args.json)
         if args.command == "add-sync":
             try:
                 return cmd_add_sync(args.config, args.dirs, run=not args.no_run,
                                     do_upload=not args.no_upload,
-                                    notify_enabled=notify_enabled)
+                                    notify_enabled=notify_enabled, json_out=args.json)
             except ConfigError as exc:
                 print(f"Config error: {exc}", file=sys.stderr)
                 return 2
+        if args.command == "delete-remote":
+            return cmd_delete_remote(cfg, args.arcnames, json_out=args.json)
+        if args.command == "retire-sync-twin":
+            return cmd_retire_sync_twin(cfg, args.arcnames, json_out=args.json)
         # bare invocation or explicit `run`: the full cycle
         return cmd_backup(cfg, do_upload=not args.no_upload,
                           dry_run=args.dry_run, notify_enabled=notify_enabled)

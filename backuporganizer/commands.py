@@ -10,110 +10,113 @@ import tempfile
 import zipfile
 from pathlib import Path
 
-from .chunks import (ChunkPlan, build_chunk, check_free_space, pack_new_members,
-                     plan_rebuilds, reconcile_chunks, repack_archive_chunk)
+from .chunks import (build_chunk, check_free_space, pack_new_members,
+                     reconcile_chunks, repack_archive_chunk)
 from .config import DEFAULT_CONFIG, Config
-from .manifest import Manifest, Member
-from .proton import UPLOAD_FAIL_MESSAGES, UploadError, download_chunk, upload_pending
-from .scanner import (DROPZONE_SETTLE_SECONDS, diff_sync_dirs, scan_dropzone,
-                      walk_files)
+from .manifest import Manifest
+from .proton import (UPLOAD_FAIL_MESSAGES, UploadError, download_chunk, download_file,
+                     proton, upload_pending, upload_sync_files)
+from .scanner import (DROPZONE_SETTLE_SECONDS, diff_sync_dirs, find_sync_twins,
+                      scan_dropzone, walk_files)
 from .util import (APP_NAME, human_size, log, move_to_trash, notify, now_iso,
                    sha256_file)
 
 
 def cmd_backup(cfg: Config, do_upload: bool, dry_run: bool, notify_enabled: bool,
                settle_seconds: int = DROPZONE_SETTLE_SECONDS) -> int:
-    """One full backup run: diff, build chunks, upload, free local space.
+    """One full backup run: diff, upload sync files, build archive chunks,
+    upload, free local space.
 
     See docs/ARCHITECTURE.md for the pipeline and its safety ordering; the
     short version is that nothing local is ever trashed before the remote
-    copy of its data is confirmed.
+    copy of its data is confirmed, and a synced file's cloud copy is never
+    removed automatically — deleting it locally only marks it an orphan
+    (see --orphans / delete-remote) for later manual removal.
     """
     manifest = Manifest.load(cfg.manifest_path)
-    forced_rebuilds = reconcile_chunks(cfg, manifest)
+    reconcile_chunks(cfg, manifest)
 
     diff = diff_sync_dirs(cfg, manifest)
-    dropzone_members, dropzone_groups, relocations = scan_dropzone(
-        cfg, manifest, settle_seconds
-    )
-
-    rebuild_plans, emptied_chunks = plan_rebuilds(cfg, manifest, diff.deleted, diff.changed)
-    planned = {p.name for p in rebuild_plans}
-    for name in forced_rebuilds - planned:
-        members = [Member.from_entry(arc, e) for arc, e in manifest.files.items()
-                   if e.get("chunk") == name]
-        if members:
-            rebuild_plans.append(ChunkPlan(name, "sync", members))
-    new_sync_plans = pack_new_members(diff.added, "sync", cfg, manifest)
-    new_arch_plans = pack_new_members(dropzone_members, "archive", cfg, manifest)
-    all_plans = rebuild_plans + new_sync_plans + new_arch_plans
+    dropzone_members, dropzone_groups = scan_dropzone(cfg, manifest, settle_seconds)
+    new_arch_plans = pack_new_members(dropzone_members, cfg, manifest)
 
     log.info(
         "Diff: %d added, %d changed, %d deleted, %d touched, %d dropzone file(s) "
-        "-> %d chunk build(s), %d chunk removal(s).",
+        "-> %d archive chunk(s).",
         len(diff.added), len(diff.changed), len(diff.deleted), len(diff.touched),
-        len(dropzone_members), len(all_plans), len(emptied_chunks),
+        len(dropzone_members), len(new_arch_plans),
     )
 
     if dry_run:
         for label, items in (
-            ("ADD", [m.arcname for m in diff.added]),
-            ("UPDATE", [m.arcname for m in diff.changed]),
-            ("DELETE", diff.deleted),
+            ("SYNC ADD", [m.arcname for m in diff.added]),
+            ("SYNC UPDATE", [m.arcname for m in diff.changed]),
+            ("SYNC DELETE", diff.deleted),
             ("ARCHIVE", [m.arcname for m in dropzone_members]),
         ):
             for arc in items:
-                print(f"{label:8} {arc}")
-        for plan in all_plans:
-            print(f"CHUNK    {plan.name} ({plan.kind}, {len(plan.members)} file(s), "
+                print(f"{label:12} {arc}")
+        for plan in new_arch_plans:
+            print(f"CHUNK        {plan.name} ({len(plan.members)} file(s), "
                   f"{human_size(plan.total_bytes)})")
-        for name in emptied_chunks:
-            print(f"REMOVE   {name} (no members left)")
         print("\nNothing was modified.")
         return 0
 
-    # ----- build chunks ---------------------------------------------------- #
-    if all_plans:
-        check_free_space(cfg, sum(p.total_bytes for p in all_plans))
-        for plan in all_plans:
+    # ----- build archive chunks --------------------------------------------- #
+    if new_arch_plans:
+        check_free_space(cfg, sum(p.total_bytes for p in new_arch_plans))
+        for plan in new_arch_plans:
             log.info("Building %s (%d file(s), %s)...",
                      plan.name, len(plan.members), human_size(plan.total_bytes))
             manifest.chunks[plan.name] = build_chunk(cfg, plan)
 
-    # ----- update manifest ------------------------------------------------- #
+    # ----- update manifest --------------------------------------------------- #
     for arc in diff.deleted:
-        manifest.files.pop(arc, None)
-    trash_remote: list[str] = []
-    for name in emptied_chunks:
-        meta = manifest.chunks.pop(name, None)
-        cfg.chunk_path(name).unlink(missing_ok=True)
-        if meta and meta["uploaded"]:
-            trash_remote.append(name)
-    for plan in all_plans:
-        for m in plan.members:
-            manifest.files[m.arcname] = m.to_entry(plan.name)
+        entry = manifest.files.pop(arc, None)
+        if entry:
+            manifest.deleted_sync[arc] = {
+                "size": entry["size"], "sha256": entry["sha256"],
+                "origin": entry["origin"], "deleted_at": now_iso(),
+            }
+    for m in diff.added:
+        manifest.deleted_sync.pop(m.arcname, None)  # reappeared: no longer orphaned
+        manifest.files[m.arcname] = m.to_entry_sync(uploaded="")
+    for m in diff.changed:
+        manifest.files[m.arcname] = m.to_entry_sync(uploaded="")
     for m in diff.touched:
-        chunk = manifest.files[m.arcname]["chunk"]
-        manifest.files[m.arcname] = m.to_entry(chunk)
+        prior_uploaded = manifest.files[m.arcname].get("uploaded", "")
+        manifest.files[m.arcname] = m.to_entry_sync(uploaded=prior_uploaded)
+    for plan in new_arch_plans:
+        for m in plan.members:
+            manifest.files[m.arcname] = m.to_entry_archive(plan.name)
     manifest.last_backup = now_iso()
     manifest.save()
 
-    # ----- upload, then free local space ------------------------------------ #
-    uploaded = freed = 0
+    # ----- upload sync files, then archive chunks, then free local space ---- #
+    sync_uploaded = archive_uploaded = freed = 0
     upload_error: UploadError | None = None
-    pending_upload = any(
-        not meta["uploaded"] and cfg.chunk_path(name).is_file()
-        for name, meta in manifest.chunks.items()
-    )
-    if do_upload and (pending_upload or all_plans or trash_remote or diff.deleted or diff.touched):
-        uploaded, freed, upload_error = upload_pending(cfg, manifest, trash_remote)
+    if do_upload:
+        sync_uploaded, upload_error = upload_sync_files(cfg, manifest)
         if upload_error:
-            log.error("Upload failed (%s): %s", upload_error.kind, upload_error)
+            log.error("Sync upload failed (%s): %s", upload_error.kind, upload_error)
+
+    if do_upload and upload_error is None:
+        trash_remote = list(manifest.pending_remote_cleanup)
+        pending_chunk_upload = any(
+            not meta["uploaded"] and cfg.chunk_path(name).is_file()
+            for name, meta in manifest.chunks.items()
+        )
+        if pending_chunk_upload or new_arch_plans or trash_remote:
+            archive_uploaded, freed, upload_error = upload_pending(cfg, manifest, trash_remote)
+            if upload_error:
+                log.error("Archive upload failed (%s): %s", upload_error.kind, upload_error)
+            else:
+                manifest.pending_remote_cleanup = []
+                manifest.save()
 
     # ----- trash dropzone originals whose chunks are confirmed uploaded ----- #
     trashed = 0
     waiting = 0
-    relocated = 0
     for top, arcnames in dropzone_groups.items():
         fully_uploaded = all(
             a in manifest.files
@@ -124,24 +127,6 @@ def cmd_backup(cfg: Config, do_upload: bool, dry_run: bool, notify_enabled: bool
             if move_to_trash(top):
                 trashed += 1
                 log.info("Uploaded and trashed dropzone entry: %s", top.name)
-            # The dropped content was copied out of a synced area: now that
-            # the archive copy is confirmed uploaded, retire the sync-area
-            # original so only the archived copy remains.
-            for arc in arcnames:
-                for twin in relocations.get(arc, []):
-                    p = Path(twin["origin"])
-                    if not p.is_file():
-                        continue  # was a true move, nothing left to retire
-                    st = p.stat()
-                    unchanged = (st.st_size == twin["size"]
-                                 and st.st_mtime_ns == twin["mtime_ns"]) \
-                        or sha256_file(p) == twin["sha256"]
-                    if not unchanged:
-                        log.warning("Sync copy of archived %s changed; keeping it: %s", arc, p)
-                        continue
-                    if move_to_trash(p):
-                        relocated += 1
-                        log.info("Retired sync copy of archived %s: %s", arc, p)
         else:
             waiting += 1
             log.info("Dropzone entry kept until its upload is confirmed: %s", top.name)
@@ -153,17 +138,17 @@ def cmd_backup(cfg: Config, do_upload: bool, dry_run: bool, notify_enabled: bool
     parts = [f"{len(diff.added)} added, {len(diff.changed)} updated, {len(diff.deleted)} removed"]
     if trashed or waiting:
         parts.append(f"{trashed} dropzone item(s) offloaded")
-    if relocated:
-        parts.append(f"{relocated} sync cop(ies) retired to archive")
-    if uploaded:
-        parts.append(f"{uploaded} chunk(s) uploaded")
+    if sync_uploaded:
+        parts.append(f"{sync_uploaded} sync file(s) uploaded")
+    if archive_uploaded:
+        parts.append(f"{archive_uploaded} chunk(s) uploaded")
     if freed:
         parts.append(f"{human_size(freed)} freed locally")
     notify(APP_NAME, "Backup OK — " + ", ".join(parts) + ".", notify_enabled)
     return 0
 
 
-def cmd_status(cfg: Config) -> int:
+def cmd_status(cfg: Config, json_out: bool = False) -> int:
     """Print a summary of the backup state (reads only the manifest)."""
     manifest = Manifest.load(cfg.manifest_path)
     total = len(manifest.files)
@@ -172,6 +157,9 @@ def cmd_status(cfg: Config) -> int:
     arch_n = total - sync_n
     n_chunks = len(manifest.chunks)
     pending_chunks = [n for n, m in manifest.chunks.items() if not m["uploaded"]]
+    pending_sync = sum(
+        1 for e in manifest.files.values() if e.get("source") == "sync" and not e.get("uploaded")
+    )
     local_bytes = sum(
         cfg.chunk_path(n).stat().st_size
         for n in manifest.chunks if cfg.chunk_path(n).is_file()
@@ -183,29 +171,75 @@ def cmd_status(cfg: Config) -> int:
             if not p.name.startswith(".") and not cfg.is_excluded(p.name)
         )
 
+    if json_out:
+        print(json.dumps({
+            "files_total": total, "sync_count": sync_n, "archive_count": arch_n,
+            "total_bytes": total_bytes, "chunks_total": n_chunks,
+            "chunks_pending": sorted(pending_chunks), "sync_pending": pending_sync,
+            "orphans_pending": len(manifest.deleted_sync),
+            "local_cache_bytes": local_bytes, "last_backup": manifest.last_backup,
+            "last_upload": manifest.last_upload, "dropzone_pending": pending,
+            "remote_folder": cfg.remote_folder,
+        }))
+        return 0
+
     lines = [
         f"{APP_NAME} status",
         "-" * 36,
         f"Files backed up:    {total}  ({sync_n} sync, {arch_n} archived)",
         f"Total size:         {human_size(total_bytes)}",
         f"Chunks:             {n_chunks} on {cfg.remote_folder}",
-        f"Awaiting upload:    {len(pending_chunks)} chunk(s)"
+        f"Awaiting upload:    {len(pending_chunks)} chunk(s), {pending_sync} sync file(s)"
         + (f" ({', '.join(sorted(pending_chunks))})" if pending_chunks else ""),
         f"Local chunk cache:  {human_size(local_bytes)}",
         f"Last backup:        {manifest.last_backup or 'never'}",
         f"Last upload:        {manifest.last_upload or 'never'}",
         f"Dropzone pending:   {pending} item(s)",
+        f"Orphaned in cloud:  {len(manifest.deleted_sync)} item(s) (see --orphans)",
     ]
     print("\n".join(lines))
+    return 0
+
+
+def cmd_list(cfg: Config, kind: str, json_out: bool = False) -> int:
+    """List backed-up files (kind: "sync", "archive", or "all")."""
+    manifest = Manifest.load(cfg.manifest_path)
+    entries = []
+    for arc, e in sorted(manifest.files.items()):
+        source = e.get("source")
+        if kind == "sync" and source != "sync":
+            continue
+        if kind == "archive" and source != "dropzone":
+            continue
+        row = {"arcname": arc, "size": e["size"], "sha256": e["sha256"], "source": source}
+        if source == "sync":
+            row["uploaded"] = e.get("uploaded", "")
+        else:
+            row["chunk"] = e.get("chunk", "")
+            row["uploaded"] = bool(manifest.chunks.get(e.get("chunk", ""), {}).get("uploaded"))
+            twins = find_sync_twins(manifest, arc)
+            row["relocatable"] = bool(twins)
+            row["twin_confirmed"] = row["uploaded"]
+        entries.append(row)
+    if json_out:
+        print(json.dumps(entries))
+        return 0
+    if not entries:
+        print(f"Nothing backed up ({kind}).")
+        return 1
+    for row in entries:
+        print(f"{row['arcname']}  ({human_size(row['size'])}, {row['source']})")
     return 0
 
 
 def cmd_advice(cfg: Config, target: Path) -> int:
     """Report which files in a directory are safe to delete locally.
 
-    Safe means byte-identical content exists in a chunk that is *confirmed
-    uploaded* — once local chunks are deleted, Proton Drive is the only copy,
-    so a pending chunk is not good enough. Advisory only; deletes nothing.
+    Safe means byte-identical content is *confirmed uploaded* — for an
+    archived file that means its chunk is confirmed uploaded, for a synced
+    file its own per-file upload is confirmed. Advisory only; deletes
+    nothing (and for a synced file, "safe" here is about local disk space
+    only — the cloud copy stays until manually deleted; see --orphans).
     """
     target = target.expanduser().resolve()
     if not target.is_dir():
@@ -217,7 +251,9 @@ def cmd_advice(cfg: Config, target: Path) -> int:
         return 1
 
     def is_safe(entry: dict) -> bool:
-        return bool(manifest.chunks.get(entry.get("chunk", ""), {}).get("uploaded"))
+        if entry.get("source") == "dropzone":
+            return bool(manifest.chunks.get(entry.get("chunk", ""), {}).get("uploaded"))
+        return bool(entry.get("uploaded"))
 
     by_hash = {e["sha256"]: arc for arc, e in manifest.files.items() if is_safe(e)}
     by_origin = {e["origin"]: (arc, e) for arc, e in manifest.files.items() if is_safe(e)}
@@ -259,11 +295,13 @@ def cmd_advice(cfg: Config, target: Path) -> int:
 
 
 def cmd_restore(cfg: Config, pattern: str, dest: Path) -> int:
-    """Restore files by name/glob/folder, downloading only their chunks.
+    """Restore files by name/glob/folder.
 
-    A pattern ending in "/" restores exactly that folder subtree; otherwise
-    globs and case-insensitive substrings match anywhere in the path. Every
-    restored file is verified against its manifest SHA-256.
+    Archived files download only their chunk; synced files download
+    individually (they were never zipped). A pattern ending in "/" restores
+    exactly that folder subtree; otherwise globs and case-insensitive
+    substrings match anywhere in the path. Every restored file is verified
+    against its manifest SHA-256.
     """
     manifest = Manifest.load(cfg.manifest_path)
     if pattern.endswith("/"):
@@ -279,13 +317,33 @@ def cmd_restore(cfg: Config, pattern: str, dest: Path) -> int:
     dest = dest.expanduser()
     dest.mkdir(parents=True, exist_ok=True)
 
+    sync_arcs = [a for a in matches if manifest.files[a].get("source") == "sync"]
     by_chunk: dict[str, list[str]] = {}
     for arc in matches:
+        if arc in sync_arcs:
+            continue
         by_chunk.setdefault(manifest.files[arc]["chunk"], []).append(arc)
-    print(f"Restoring {len(matches)} file(s) from {len(by_chunk)} chunk(s) to {dest}")
+    print(f"Restoring {len(matches)} file(s) "
+          f"({len(sync_arcs)} synced, {len(by_chunk)} archive chunk(s)) to {dest}")
 
     failures = 0
     with tempfile.TemporaryDirectory(dir=cfg.backup_dir if cfg.backup_dir.is_dir() else None) as tmp:
+        for arc in sync_arcs:
+            out = dest / arc
+            out.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                downloaded = download_file(cfg, cfg.remote_path(arc), Path(tmp))
+                shutil.move(str(downloaded), out)
+            except UploadError as exc:
+                print(f"  ERROR: {exc}", file=sys.stderr)
+                failures += 1
+                continue
+            if sha256_file(out) == manifest.files[arc]["sha256"]:
+                print(f"  OK  {arc}")
+            else:
+                failures += 1
+                print(f"  HASH MISMATCH  {arc} (restored file kept for inspection)",
+                      file=sys.stderr)
         for chunk_name, arcs in sorted(by_chunk.items()):
             local = cfg.chunk_path(chunk_name)
             if not local.is_file():
@@ -316,13 +374,134 @@ def cmd_restore(cfg: Config, pattern: str, dest: Path) -> int:
     return 0
 
 
+def cmd_orphans(cfg: Config, json_out: bool = False) -> int:
+    """List synced files deleted locally but still present in the cloud —
+    read-only, deletes nothing. See delete-remote to actually remove one."""
+    manifest = Manifest.load(cfg.manifest_path)
+    orphans = [
+        {"arcname": arc, **entry} for arc, entry in sorted(manifest.deleted_sync.items())
+    ]
+    if json_out:
+        print(json.dumps(orphans))
+        return 0
+    if not orphans:
+        print("No orphaned cloud copies.")
+        return 0
+    print(f"{len(orphans)} synced file(s) removed locally, still in the cloud:")
+    for o in orphans:
+        print(f"  {o['arcname']}  ({human_size(o['size'])}, deleted locally {o['deleted_at']})")
+    print("\nRun `delete-remote ARCNAME...` to permanently remove a cloud copy.")
+    return 0
+
+
+def cmd_delete_remote(cfg: Config, arcnames: list[str], json_out: bool = False) -> int:
+    """Permanently delete the cloud copy of an orphaned synced file.
+
+    Scoped to orphans only (manifest.deleted_sync): an arcname still live in
+    manifest.files is refused, since deleting its cloud copy would just get
+    silently re-uploaded on the next run — removing a file from sync
+    entirely is a sync_dirs config edit, not a per-file action.
+    """
+    manifest = Manifest.load(cfg.manifest_path)
+    deleted: list[str] = []
+    not_found: list[str] = []
+    errors: dict[str, str] = {}
+    for arc in arcnames:
+        if arc not in manifest.deleted_sync:
+            not_found.append(arc)
+            continue
+        proc = proton(cfg, "filesystem", "trash", cfg.remote_path(arc))
+        if proc.returncode != 0:
+            errors[arc] = (proc.stderr + proc.stdout).strip()[:500]
+            continue
+        del manifest.deleted_sync[arc]
+        deleted.append(arc)
+    manifest.save()
+    result = {"deleted": deleted, "not_found": not_found, "errors": errors}
+    if json_out:
+        print(json.dumps(result))
+    else:
+        for arc in deleted:
+            print(f"Deleted from the cloud: {arc}")
+        for arc in not_found:
+            print(f"Not an orphaned synced file, skipped: {arc}", file=sys.stderr)
+        for arc, msg in errors.items():
+            print(f"ERROR deleting {arc}: {msg}", file=sys.stderr)
+    return 1 if (not_found or errors) else 0
+
+
+def cmd_retire_sync_twin(cfg: Config, archive_arcnames: list[str],
+                         json_out: bool = False) -> int:
+    """Retire the synced copy(ies) of already-archived file(s): trash the
+    remote sync copy and move the local sync-dir original to the Trash,
+    keeping only the archived (zipped) copy.
+
+    Does not prompt — the caller (the GUI, after its own confirmation
+    dialog) must already have decided to do this. Still refuses to act on
+    an unsafe state: the archive copy's chunk must be confirmed uploaded
+    before its sync twin is touched, and each twin is re-verified
+    byte-identical immediately before it's trashed (it may have changed
+    since the archive copy was made).
+    """
+    manifest = Manifest.load(cfg.manifest_path)
+    retired: list[dict] = []
+    skipped: list[dict] = []
+    for arc in archive_arcnames:
+        entry = manifest.files.get(arc)
+        if not entry or entry.get("source") != "dropzone":
+            skipped.append({"archive_arcname": arc, "reason": "not an archived file"})
+            continue
+        if not manifest.chunks.get(entry.get("chunk", ""), {}).get("uploaded"):
+            skipped.append({"archive_arcname": arc, "reason": "archive copy not confirmed uploaded"})
+            continue
+        twins = find_sync_twins(manifest, arc)
+        if not twins:
+            skipped.append({"archive_arcname": arc, "reason": "no live sync twin"})
+            continue
+        for sync_arc, twin in twins:
+            p = Path(twin["origin"])
+            if not p.is_file():
+                skipped.append({"archive_arcname": arc, "sync_arcname": sync_arc,
+                                "reason": "sync original already gone"})
+                continue
+            st = p.stat()
+            unchanged = (st.st_size == twin["size"] and st.st_mtime_ns == twin["mtime_ns"]) \
+                or sha256_file(p) == twin["sha256"]
+            if not unchanged:
+                skipped.append({"archive_arcname": arc, "sync_arcname": sync_arc,
+                                "reason": "sync copy changed since archiving"})
+                continue
+            if twin.get("uploaded"):
+                proc = proton(cfg, "filesystem", "trash", cfg.remote_path(sync_arc))
+                if proc.returncode != 0:
+                    skipped.append({"archive_arcname": arc, "sync_arcname": sync_arc,
+                                    "reason": f"remote trash failed: {proc.stderr.strip()[:200]}"})
+                    continue
+            if not move_to_trash(p):
+                skipped.append({"archive_arcname": arc, "sync_arcname": sync_arc,
+                                "reason": "local trash failed"})
+                continue
+            manifest.files.pop(sync_arc, None)
+            retired.append({"archive_arcname": arc, "sync_arcname": sync_arc})
+    manifest.save()
+    result = {"retired": retired, "skipped": skipped}
+    if json_out:
+        print(json.dumps(result))
+    else:
+        for r in retired:
+            print(f"Retired synced copy of {r['archive_arcname']}: {r['sync_arcname']}")
+        for s in skipped:
+            print(f"Skipped {s['archive_arcname']}: {s['reason']}", file=sys.stderr)
+    return 1 if skipped and not retired else 0
+
+
 def cmd_dedupe(cfg: Config, min_mb: float, notify_enabled: bool) -> int:
     """Find files stored more than once and interactively keep one copy.
 
-    Removed sync copies are re-verified and moved to the local Trash (the
-    next backup run drops them from their chunks — removing only the backup
-    entry would be useless, the mirror would re-add it). Removed archive
-    copies are repacked out of their chunks.
+    Removed sync copies are re-verified and moved to the local Trash; the
+    next backup run notices they're gone and marks their cloud copies as
+    orphaned for later manual removal (see --orphans / delete-remote).
+    Removed archive copies are repacked out of their chunks.
     """
     manifest = Manifest.load(cfg.manifest_path)
     by_hash: dict[str, list[str]] = {}
@@ -425,44 +604,85 @@ def cmd_dedupe(cfg: Config, min_mb: float, notify_enabled: bool) -> int:
 
 
 def cmd_archive(cfg: Config, paths: list[Path], run: bool, do_upload: bool,
-                notify_enabled: bool) -> int:
+                notify_enabled: bool, json_out: bool = False) -> int:
     """Move files/folders into the dropzone, then run the full cycle.
 
     The dropzone settle delay is skipped: an explicit `archive` invocation
-    means the files are complete. Archiving something from inside a sync dir
-    is a natural move-to-archive: the sync side sees the deletion, the
-    archive side stores it, exactly one copy remains.
+    means the files are complete. Archiving something out of a sync dir just
+    moves the file — the sync side sees the deletion (and the cloud sync
+    copy becomes an orphan, kept until manually deleted; see --orphans),
+    while the archive side stores the new zipped copy.
+
+    With json_out, prints one JSON object instead of the human-readable
+    log, including a "relocatable" list of archived files that still have a
+    live sync-dir twin with identical content — callers (the GUI) use this
+    to offer retiring that twin via retire-sync-twin.
     """
     cfg.dropzone.mkdir(parents=True, exist_ok=True)
-    moved = 0
+    moved: list[tuple[Path, Path]] = []  # (original, dest)
+    skipped: list[str] = []
     for raw in paths:
         p = raw.expanduser()
         if not p.exists():
-            print(f"Not found, skipped: {p}", file=sys.stderr)
+            skipped.append(str(p))
+            if not json_out:
+                print(f"Not found, skipped: {p}", file=sys.stderr)
             continue
         if cfg.dropzone in p.parents or p == cfg.dropzone:
-            print(f"Already in the dropzone, skipped: {p}")
+            if not json_out:
+                print(f"Already in the dropzone, skipped: {p}")
             continue
         dest = cfg.dropzone / p.name
         if dest.exists():
             stamp = now_iso().replace(":", "").replace("-", "")[:15]
             dest = cfg.dropzone / f"{p.stem}_{stamp}{p.suffix}"
         shutil.move(str(p), dest)
-        moved += 1
-        print(f"→ dropzone: {p}  (as {dest.name})")
-    if moved == 0:
-        print("Nothing to archive.")
+        moved.append((p, dest))
+        if not json_out:
+            print(f"→ dropzone: {p}  (as {dest.name})")
+    if not moved:
+        if json_out:
+            print(json.dumps({"moved": [], "skipped": skipped, "relocatable": []}))
+        else:
+            print("Nothing to archive.")
         return 1
     if not run:
-        print(f"{moved} item(s) staged; they will be archived on the next backup run.")
+        if json_out:
+            print(json.dumps({
+                "moved": [str(d) for _, d in moved], "skipped": skipped,
+                "staged_only": True, "relocatable": [],
+            }))
+        else:
+            print(f"{len(moved)} item(s) staged; they will be archived on the next backup run.")
         return 0
-    print(f"{moved} item(s) staged — running the backup cycle now.")
-    return cmd_backup(cfg, do_upload=do_upload, dry_run=False,
-                      notify_enabled=notify_enabled, settle_seconds=0)
+    if not json_out:
+        print(f"{len(moved)} item(s) staged — running the backup cycle now.")
+    rc = cmd_backup(cfg, do_upload=do_upload, dry_run=False,
+                    notify_enabled=notify_enabled, settle_seconds=0)
+    if json_out:
+        manifest = Manifest.load(cfg.manifest_path)
+        dest_roots = [d for _, d in moved]
+        relocatable = []
+        for arc, e in manifest.files.items():
+            if e.get("source") != "dropzone":
+                continue
+            origin = Path(e["origin"])
+            if not any(origin == root or root in origin.parents for root in dest_roots):
+                continue
+            for sync_arc, _ in find_sync_twins(manifest, arc):
+                relocatable.append({
+                    "archive_arcname": arc, "sync_arcname": sync_arc,
+                    "twin_confirmed": bool(manifest.chunks.get(e.get("chunk", ""), {}).get("uploaded")),
+                })
+        print(json.dumps({
+            "moved": [str(d) for _, d in moved], "skipped": skipped,
+            "staged_only": False, "backup_exit_code": rc, "relocatable": relocatable,
+        }))
+    return rc
 
 
 def cmd_add_sync(config_path: Path, dirs: list[Path], run: bool, do_upload: bool,
-                 notify_enabled: bool) -> int:
+                 notify_enabled: bool, json_out: bool = False) -> int:
     """Add folder(s) to sync_dirs in the config, then run the full cycle.
 
     The updated config is validated (existence, basename collisions,
@@ -472,19 +692,28 @@ def cmd_add_sync(config_path: Path, dirs: list[Path], run: bool, do_upload: bool
     raw = json.loads(config_path.read_text())
     current = [str(Path(d).expanduser()) for d in raw.get("sync_dirs", [])]
     added = []
+    skipped = []
     for d in dirs:
         p = d.expanduser().resolve()
         if not p.is_dir():
-            print(f"Not a directory: {p} — sync entries must be folders; "
-                  "use `archive` for single files.", file=sys.stderr)
+            if json_out:
+                print(json.dumps({"error": f"Not a directory: {p}"}))
+            else:
+                print(f"Not a directory: {p} — sync entries must be folders; "
+                      "use `archive` for single files.", file=sys.stderr)
             return 2
         if str(p) in current:
-            print(f"Already a sync dir, skipped: {p}")
+            skipped.append(str(p))
+            if not json_out:
+                print(f"Already a sync dir, skipped: {p}")
             continue
         current.append(str(p))
         added.append(p)
     if not added:
-        print("Nothing new to add.")
+        if json_out:
+            print(json.dumps({"added": [], "skipped": skipped}))
+        else:
+            print("Nothing new to add.")
         return 1
 
     candidate = dict(raw)
@@ -492,14 +721,23 @@ def cmd_add_sync(config_path: Path, dirs: list[Path], run: bool, do_upload: bool
     cfg = Config.from_raw(candidate)  # raises ConfigError on collisions/overlap
 
     config_path.write_text(json.dumps(candidate, indent=2) + "\n")
-    for p in added:
-        print(f"Added to sync: {p}")
+    if not json_out:
+        for p in added:
+            print(f"Added to sync: {p}")
     if not run:
-        print("They will be backed up on the next run.")
+        if json_out:
+            print(json.dumps({"added": [str(p) for p in added], "skipped": skipped,
+                              "staged_only": True}))
+        else:
+            print("They will be backed up on the next run.")
         return 0
-    print("Running the backup cycle now.")
-    return cmd_backup(cfg, do_upload=do_upload, dry_run=False,
-                      notify_enabled=notify_enabled)
+    if not json_out:
+        print("Running the backup cycle now.")
+    rc = cmd_backup(cfg, do_upload=do_upload, dry_run=False, notify_enabled=notify_enabled)
+    if json_out:
+        print(json.dumps({"added": [str(p) for p in added], "skipped": skipped,
+                          "staged_only": False, "backup_exit_code": rc}))
+    return rc
 
 
 def cmd_init(config_path: Path) -> int:
