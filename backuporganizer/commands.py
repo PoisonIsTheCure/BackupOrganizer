@@ -18,12 +18,12 @@ from .proton import (UPLOAD_FAIL_MESSAGES, UploadError, download_chunk, download
                      proton, upload_pending, upload_sync_files)
 from .scanner import (DROPZONE_SETTLE_SECONDS, diff_sync_dirs, find_sync_twins,
                       scan_dropzone, walk_files)
-from .util import (APP_NAME, human_size, log, move_to_trash, notify, now_iso,
-                   sha256_file)
+from .util import (APP_NAME, BackupError, human_size, log, move_to_trash, notify,
+                   now_iso, sha256_file)
 
 
 def cmd_backup(cfg: Config, do_upload: bool, dry_run: bool, notify_enabled: bool,
-               settle_seconds: int = DROPZONE_SETTLE_SECONDS) -> int:
+               settle_seconds: int = DROPZONE_SETTLE_SECONDS, json_out: bool = False) -> int:
     """One full backup run: diff, upload sync files, build archive chunks,
     upload, free local space.
 
@@ -32,7 +32,17 @@ def cmd_backup(cfg: Config, do_upload: bool, dry_run: bool, notify_enabled: bool
     copy of its data is confirmed, and a synced file's cloud copy is never
     removed automatically — deleting it locally only marks it an orphan
     (see --orphans / delete-remote) for later manual removal.
+
+    With json_out, prints one NDJSON progress event per line at each
+    pipeline stage (for a GUI's live progress view), always ending in
+    exactly one {"event": "result", ...} line summarizing the outcome —
+    callers should key off that event, not "the last line", since a fatal
+    error is reported the same way rather than as a Python exception.
     """
+    def emit(event: dict) -> None:
+        if json_out:
+            print(json.dumps(event), flush=True)
+
     manifest = Manifest.load(cfg.manifest_path)
     reconcile_chunks(cfg, manifest)
 
@@ -46,6 +56,9 @@ def cmd_backup(cfg: Config, do_upload: bool, dry_run: bool, notify_enabled: bool
         len(diff.added), len(diff.changed), len(diff.deleted), len(diff.touched),
         len(dropzone_members), len(new_arch_plans),
     )
+    emit({"event": "diff", "added": len(diff.added), "changed": len(diff.changed),
+         "deleted": len(diff.deleted), "touched": len(diff.touched),
+         "dropzone": len(dropzone_members)})
 
     if dry_run:
         for label, items in (
@@ -64,11 +77,21 @@ def cmd_backup(cfg: Config, do_upload: bool, dry_run: bool, notify_enabled: bool
 
     # ----- build archive chunks --------------------------------------------- #
     if new_arch_plans:
-        check_free_space(cfg, sum(p.total_bytes for p in new_arch_plans))
-        for plan in new_arch_plans:
-            log.info("Building %s (%d file(s), %s)...",
-                     plan.name, len(plan.members), human_size(plan.total_bytes))
-            manifest.chunks[plan.name] = build_chunk(cfg, plan)
+        try:
+            check_free_space(cfg, sum(p.total_bytes for p in new_arch_plans))
+            for i, plan in enumerate(new_arch_plans, 1):
+                log.info("Building %s (%d file(s), %s)...",
+                         plan.name, len(plan.members), human_size(plan.total_bytes))
+                manifest.chunks[plan.name] = build_chunk(cfg, plan)
+                emit({"event": "chunk_build", "name": plan.name, "index": i,
+                     "total": len(new_arch_plans), "files": len(plan.members)})
+        except BackupError as exc:
+            if not json_out:
+                raise  # let cli.py's top-level handler log + notify once
+            log.error("%s", exc)
+            notify(APP_NAME, f"Backup FAILED: {exc}", notify_enabled)
+            emit({"event": "result", "ok": False, "error": str(exc)})
+            return 1
 
     # ----- update manifest --------------------------------------------------- #
     for arc in diff.deleted:
@@ -96,7 +119,13 @@ def cmd_backup(cfg: Config, do_upload: bool, dry_run: bool, notify_enabled: bool
     sync_uploaded = archive_uploaded = freed = 0
     upload_error: UploadError | None = None
     if do_upload:
-        sync_uploaded, upload_error = upload_sync_files(cfg, manifest)
+        pending_sync = sum(
+            1 for e in manifest.files.values()
+            if e.get("source") == "sync" and not e.get("uploaded")
+        )
+        if pending_sync:
+            emit({"event": "sync_upload_start", "count": pending_sync})
+        sync_uploaded, upload_error = upload_sync_files(cfg, manifest, on_progress=emit)
         if upload_error:
             log.error("Sync upload failed (%s): %s", upload_error.kind, upload_error)
 
@@ -107,7 +136,9 @@ def cmd_backup(cfg: Config, do_upload: bool, dry_run: bool, notify_enabled: bool
             for name, meta in manifest.chunks.items()
         )
         if pending_chunk_upload or new_arch_plans or trash_remote:
-            archive_uploaded, freed, upload_error = upload_pending(cfg, manifest, trash_remote)
+            emit({"event": "archive_upload_start"})
+            archive_uploaded, freed, upload_error = upload_pending(
+                cfg, manifest, trash_remote, on_progress=emit)
             if upload_error:
                 log.error("Archive upload failed (%s): %s", upload_error.kind, upload_error)
             else:
@@ -127,6 +158,7 @@ def cmd_backup(cfg: Config, do_upload: bool, dry_run: bool, notify_enabled: bool
             if move_to_trash(top):
                 trashed += 1
                 log.info("Uploaded and trashed dropzone entry: %s", top.name)
+                emit({"event": "dropzone_trashed", "name": top.name})
         else:
             waiting += 1
             log.info("Dropzone entry kept until its upload is confirmed: %s", top.name)
@@ -134,6 +166,11 @@ def cmd_backup(cfg: Config, do_upload: bool, dry_run: bool, notify_enabled: bool
     # ----- report ------------------------------------------------------------ #
     if upload_error:
         notify(APP_NAME, UPLOAD_FAIL_MESSAGES[upload_error.kind], notify_enabled)
+        emit({"event": "result", "ok": False, "error": str(upload_error),
+             "error_kind": upload_error.kind, "added": len(diff.added),
+             "changed": len(diff.changed), "deleted": len(diff.deleted),
+             "sync_uploaded": sync_uploaded, "archive_uploaded": archive_uploaded,
+             "freed_bytes": freed, "trashed": trashed, "waiting": waiting})
         return 1
     parts = [f"{len(diff.added)} added, {len(diff.changed)} updated, {len(diff.deleted)} removed"]
     if trashed or waiting:
@@ -145,6 +182,10 @@ def cmd_backup(cfg: Config, do_upload: bool, dry_run: bool, notify_enabled: bool
     if freed:
         parts.append(f"{human_size(freed)} freed locally")
     notify(APP_NAME, "Backup OK — " + ", ".join(parts) + ".", notify_enabled)
+    emit({"event": "result", "ok": True, "error": None, "added": len(diff.added),
+         "changed": len(diff.changed), "deleted": len(diff.deleted),
+         "sync_uploaded": sync_uploaded, "archive_uploaded": archive_uploaded,
+         "freed_bytes": freed, "trashed": trashed, "waiting": waiting})
     return 0
 
 

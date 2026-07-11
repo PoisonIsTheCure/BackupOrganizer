@@ -98,26 +98,94 @@ actor BackendClient {
     // MARK: - Mutating (buttons stay disabled in the read-only skeleton;
     // wired up once the interactive flows land)
 
+    // NOTE: argparse subparsers own everything after the subcommand token,
+    // so global flags like --json/--no-notify MUST precede the subcommand
+    // (e.g. "--json archive PATH", never "archive PATH --json") — only
+    // flags the subcommand itself defines (like archive's --no-run) may
+    // follow it. Verified against the real CLI; getting this backwards
+    // fails with argparse's "unrecognized arguments" for every mutating call.
+
     func archive(paths: [String], run runCycle: Bool = true) async throws -> ArchiveResult {
-        var args = ["archive"] + paths
+        var args = ["--json", "--no-notify", "archive"] + paths
         if !runCycle { args.append("--no-run") }
-        args += ["--json", "--no-notify"]
         return try await runJSON(args)
     }
 
     func addSync(dirs: [String], run runCycle: Bool = true) async throws -> AddSyncResult {
-        var args = ["add-sync"] + dirs
+        var args = ["--json", "--no-notify", "add-sync"] + dirs
         if !runCycle { args.append("--no-run") }
-        args += ["--json", "--no-notify"]
         return try await runJSON(args)
     }
 
     func deleteRemote(arcnames: [String]) async throws -> DeleteRemoteResult {
-        try await runJSON(["delete-remote"] + arcnames + ["--json", "--no-notify"])
+        try await runJSON(["--json", "--no-notify", "delete-remote"] + arcnames)
     }
 
     func retireSyncTwin(arcnames: [String]) async throws -> RetireSyncTwinResult {
-        try await runJSON(["retire-sync-twin"] + arcnames + ["--json", "--no-notify"])
+        try await runJSON(["--json", "--no-notify", "retire-sync-twin"] + arcnames)
+    }
+
+    /// Streams `run --json`'s NDJSON progress lines as they're printed —
+    /// this is the only long-running command, so it's the only one that
+    /// needs line-by-line streaming instead of run()'s buffer-then-decode.
+    /// The stream always ends either with an `event == "result"` element
+    /// (success or a reported failure) or a thrown error (the process
+    /// exited without ever printing one — an unhandled crash on the Python
+    /// side, since every reachable failure path in cmd_backup does emit
+    /// "result" when json_out is set).
+    func runBackup(dryRun: Bool = false, noUpload: Bool = false) -> AsyncThrowingStream<ProgressEvent, Error> {
+        AsyncThrowingStream { continuation in
+            Task {
+                do {
+                    let cliPath = await settings.cliPath
+                    guard FileManager.default.isExecutableFile(atPath: cliPath) else {
+                        continuation.finish(throwing: BackendError.cliNotFound(cliPath))
+                        return
+                    }
+                    let configPath = await settings.configPathOverride
+
+                    let process = Process()
+                    process.executableURL = URL(fileURLWithPath: cliPath)
+                    var args = ["--json", "--no-notify"]
+                    if dryRun { args.append("--dry-run") }
+                    if noUpload { args.append("--no-upload") }
+                    if let configPath, !configPath.isEmpty {
+                        args = ["--config", configPath] + args
+                    }
+                    args.append("run")
+                    process.arguments = args
+
+                    let stdoutPipe = Pipe()
+                    let stderrPipe = Pipe()
+                    process.standardOutput = stdoutPipe
+                    process.standardError = stderrPipe
+
+                    try process.run()
+
+                    var sawResult = false
+                    let decoder = JSONDecoder()
+                    for try await line in stdoutPipe.fileHandleForReading.bytes.lines {
+                        guard !line.isEmpty, let data = line.data(using: .utf8) else { continue }
+                        guard let event = try? decoder.decode(ProgressEvent.self, from: data) else { continue }
+                        continuation.yield(event)
+                        if event.isTerminal { sawResult = true }
+                    }
+
+                    let stderrData = try stderrPipe.fileHandleForReading.readToEndCompat()
+                    process.waitUntilExit()
+
+                    if sawResult {
+                        continuation.finish()
+                    } else {
+                        let stderrText = String(data: stderrData, encoding: .utf8) ?? ""
+                        continuation.finish(throwing: BackendError.nonZeroExit(
+                            code: process.terminationStatus, stderr: stderrText))
+                    }
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+        }
     }
 }
 

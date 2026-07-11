@@ -7,6 +7,7 @@ import json
 import re
 import subprocess
 from pathlib import Path
+from typing import Callable
 
 from .config import Config
 from .manifest import Manifest, Member
@@ -180,25 +181,30 @@ def download_file(cfg: Config, remote_path: str, dest_dir: Path) -> Path:
     return local
 
 
-def upload_pending(cfg: Config, manifest: Manifest,
-                   trash_remote: list[str]) -> tuple[int, int, UploadError | None]:
+def upload_pending(cfg: Config, manifest: Manifest, trash_remote: list[str],
+                   on_progress: Callable[[dict], None] | None = None,
+                   ) -> tuple[int, int, UploadError | None]:
     """Upload every not-yet-uploaded chunk plus the manifest.
 
     After each confirmed chunk upload the local zip is deleted (unless
     keep_local_chunks). Old remote chunks in trash_remote are only trashed
     once their replacements are up. Returns (chunks uploaded, local bytes
     freed, error) — an error stops the loop but keeps all progress saved.
+    on_progress, if given, is called with a JSON-serializable dict after
+    every confirmed chunk upload (for `run --json` NDJSON streaming).
     """
     error: UploadError | None = None
     uploaded = 0
     freed = 0
     try:
         ensure_remote_folder(cfg)
-        for name in sorted(manifest.chunks):
+        pending = sorted(
+            name for name, meta in manifest.chunks.items()
+            if not meta["uploaded"] and cfg.chunk_path(name).is_file()
+        )
+        for name in pending:
             meta = manifest.chunks[name]
             local = cfg.chunk_path(name)
-            if meta["uploaded"] or not local.is_file():
-                continue
             log.info("Uploading %s (%s) ...", name, human_size(meta["size"]))
             with open(local, "rb") as fh:
                 local_sha1 = hashlib.file_digest(fh, "sha1").hexdigest()
@@ -211,6 +217,9 @@ def upload_pending(cfg: Config, manifest: Manifest,
             if not cfg.keep_local_chunks:
                 freed += meta["size"]
                 local.unlink()
+            if on_progress:
+                on_progress({"event": "chunk_uploaded", "name": name,
+                            "index": uploaded, "total": len(pending)})
     except UploadError as exc:
         error = exc
     except (OSError, subprocess.TimeoutExpired) as exc:
@@ -233,7 +242,9 @@ def upload_pending(cfg: Config, manifest: Manifest,
     return uploaded, freed, error
 
 
-def upload_sync_files(cfg: Config, manifest: Manifest) -> tuple[int, UploadError | None]:
+def upload_sync_files(cfg: Config, manifest: Manifest,
+                      on_progress: Callable[[dict], None] | None = None,
+                      ) -> tuple[int, UploadError | None]:
     """Upload every not-yet-uploaded sync file as a plain file, mirroring the
     local directory shape remotely — no zipping, no chunk building, nothing
     written to local disk beyond the manifest.
@@ -243,7 +254,9 @@ def upload_sync_files(cfg: Config, manifest: Manifest) -> tuple[int, UploadError
     them by remote parent directory, and uploads each group in one CLI call,
     then confirms each file individually (the CLI's `info` command takes
     exactly one path). A failure stops the loop but keeps every
-    already-confirmed upload's manifest entry saved.
+    already-confirmed upload's manifest entry saved. on_progress, if given,
+    is called with a JSON-serializable dict after every confirmed file
+    upload (for `run --json` NDJSON streaming).
     """
     error: UploadError | None = None
     uploaded = 0
@@ -254,6 +267,7 @@ def upload_sync_files(cfg: Config, manifest: Manifest) -> tuple[int, UploadError
     ]
     if not members:
         return uploaded, error
+    total = len(members)
     try:
         ensure_remote_folder(cfg)
         groups: dict[str, list[Member]] = {}
@@ -275,6 +289,9 @@ def upload_sync_files(cfg: Config, manifest: Manifest) -> tuple[int, UploadError
                 manifest.files[m.arcname] = m.to_entry_sync(uploaded=now_iso())
                 uploaded += 1
                 manifest.save()  # persist progress after every file
+                if on_progress:
+                    on_progress({"event": "sync_file_uploaded", "arcname": m.arcname,
+                                "index": uploaded, "total": total})
     except UploadError as exc:
         error = exc
     except (OSError, subprocess.TimeoutExpired) as exc:

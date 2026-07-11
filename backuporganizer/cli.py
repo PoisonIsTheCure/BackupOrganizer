@@ -144,7 +144,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_retire_sync_twin(cfg, args.arcnames, json_out=args.json)
         # bare invocation or explicit `run`: the full cycle
         return cmd_backup(cfg, do_upload=not args.no_upload,
-                          dry_run=args.dry_run, notify_enabled=notify_enabled)
+                          dry_run=args.dry_run, notify_enabled=notify_enabled,
+                          json_out=args.json)
     except BackupError as exc:
         log.error("%s", exc)
         notify(APP_NAME, f"Backup FAILED: {exc}", notify_enabled)

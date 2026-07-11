@@ -147,6 +147,57 @@ struct RetireSyncTwinResult: Codable, Equatable {
     var skipped: [RetireSkip]
 }
 
+/// One NDJSON line from `run --json` (see cmd_backup in commands.py for the
+/// exact event list). Every field beyond `event` is optional because each
+/// event kind only populates a subset — this mirrors the Python side's
+/// per-event dict shapes rather than forcing one rigid schema.
+struct ProgressEvent: Codable, Equatable {
+    var event: String
+
+    // diff
+    var added: Int?
+    var changed: Int?
+    var deleted: Int?
+    var touched: Int?
+    var dropzone: Int?
+
+    // chunk_build
+    var name: String?
+    var index: Int?
+    var total: Int?
+    var files: Int?
+
+    // sync_upload_start / archive_upload_start
+    var count: Int?
+
+    // sync_file_uploaded / chunk_uploaded share name/index/total above;
+    // sync_file_uploaded also has:
+    var arcname: String?
+
+    // dropzone_trashed uses `name` above.
+
+    // result
+    var ok: Bool?
+    var error: String?
+    var errorKind: String?
+    var syncUploaded: Int?
+    var archiveUploaded: Int?
+    var freedBytes: Int?
+    var trashed: Int?
+    var waiting: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case event, added, changed, deleted, touched, dropzone, name, index, total,
+             files, count, arcname, ok, error, trashed, waiting
+        case errorKind = "error_kind"
+        case syncUploaded = "sync_uploaded"
+        case archiveUploaded = "archive_uploaded"
+        case freedBytes = "freed_bytes"
+    }
+
+    var isTerminal: Bool { event == "result" }
+}
+
 /// Result of `add-sync DIR... --json`.
 struct AddSyncResult: Codable, Equatable {
     var added: [String]

@@ -3,6 +3,9 @@ import SwiftUI
 struct ArchivedView: View {
     let client: BackendClient
     @State private var state: LoadState<[FileEntry]> = .loading
+    @State private var retirePrompt: RetireSyncPrompt?
+    @State private var retiringArcname: String?
+    @State private var actionError: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -11,6 +14,16 @@ struct ArchivedView: View {
             content
         }
         .task { await load() }
+        .confirmRetireSync(prompt: $retirePrompt) { archiveArcnames in
+            Task { await retireSyncTwin(archiveArcnames) }
+        }
+        .alert("Couldn't retire the synced copy", isPresented: Binding(
+            get: { actionError != nil }, set: { if !$0 { actionError = nil } }
+        )) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(actionError ?? "")
+        }
     }
 
     private var header: some View {
@@ -44,13 +57,19 @@ struct ArchivedView: View {
                     }
                     Spacer()
                     if file.relocatable == true {
-                        Button("Retire Synced Copy") {
-                            // Wired up in Phase 3 with a confirmation dialog.
+                        if retiringArcname == file.arcname {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Button("Retire Synced Copy") {
+                                retirePrompt = RetireSyncPrompt(
+                                    archiveArcnames: [file.arcname],
+                                    summaryLines: [file.arcname])
+                            }
+                            .disabled(file.twinConfirmed != true || retiringArcname != nil)
+                            .help(file.twinConfirmed == true
+                                  ? "Remove the synced copy of this file, keeping only the archive."
+                                  : "Waiting for the archive copy's upload to be confirmed first.")
                         }
-                        .disabled(true)
-                        .help(file.twinConfirmed == true
-                              ? "Coming in Phase 3, behind a confirmation dialog."
-                              : "Waiting for the archive copy's upload to be confirmed first.")
                     }
                     UploadBadge(uploaded: file.isUploaded)
                 }
@@ -70,6 +89,20 @@ struct ArchivedView: View {
             state = .loaded(try await client.list(kind: "archive"))
         } catch {
             state = .failed(error.localizedDescription)
+        }
+    }
+
+    private func retireSyncTwin(_ archiveArcnames: [String]) async {
+        retiringArcname = archiveArcnames.first
+        defer { retiringArcname = nil }
+        do {
+            let result = try await client.retireSyncTwin(arcnames: archiveArcnames)
+            if let skip = result.skipped.first {
+                actionError = skip.reason
+            }
+            await load()
+        } catch {
+            actionError = error.localizedDescription
         }
     }
 }

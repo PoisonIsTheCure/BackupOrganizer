@@ -4,6 +4,9 @@ struct SyncedView: View {
     let client: BackendClient
     @State private var filesState: LoadState<[FileEntry]> = .loading
     @State private var orphansState: LoadState<[OrphanEntry]> = .loading
+    @State private var pendingDelete: OrphanEntry?
+    @State private var deletingArcname: String?
+    @State private var actionError: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -16,6 +19,16 @@ struct SyncedView: View {
             .listStyle(.inset)
         }
         .task { await loadAll() }
+        .confirmDeleteRemote(orphan: $pendingDelete) { orphan in
+            Task { await deleteRemote(orphan) }
+        }
+        .alert("Couldn't delete from the cloud", isPresented: Binding(
+            get: { actionError != nil }, set: { if !$0 { actionError = nil } }
+        )) {
+            Button("OK", role: .cancel) {}
+        } message: {
+            Text(actionError ?? "")
+        }
     }
 
     private var header: some View {
@@ -48,11 +61,14 @@ struct SyncedView: View {
                                 .font(.caption).foregroundStyle(.secondary)
                         }
                         Spacer()
-                        Button("Delete from Cloud", role: .destructive) {
-                            // Wired up in Phase 3 with a confirmation dialog.
+                        if deletingArcname == orphan.arcname {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Button("Delete from Cloud", role: .destructive) {
+                                pendingDelete = orphan
+                            }
+                            .disabled(deletingArcname != nil)
                         }
-                        .disabled(true)
-                        .help("Coming in Phase 3, behind a confirmation dialog.")
                     }
                 }
             }
@@ -110,6 +126,22 @@ struct SyncedView: View {
             orphansState = .loaded(try await client.orphans())
         } catch {
             orphansState = .failed(error.localizedDescription)
+        }
+    }
+
+    private func deleteRemote(_ orphan: OrphanEntry) async {
+        deletingArcname = orphan.arcname
+        defer { deletingArcname = nil }
+        do {
+            let result = try await client.deleteRemote(arcnames: [orphan.arcname])
+            if let message = result.errors[orphan.arcname] {
+                actionError = message
+            } else if result.notFound.contains(orphan.arcname) {
+                actionError = "\(orphan.arcname) is no longer an orphan (it may have reappeared locally)."
+            }
+            await loadOrphans()
+        } catch {
+            actionError = error.localizedDescription
         }
     }
 }

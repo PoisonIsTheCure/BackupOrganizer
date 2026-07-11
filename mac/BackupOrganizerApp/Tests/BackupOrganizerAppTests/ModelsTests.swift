@@ -104,4 +104,33 @@ final class ModelsTests: XCTestCase {
         XCTAssertEqual(result.retired.count, 1)
         XCTAssertEqual(result.skipped.first?.reason, "sync copy changed since archiving")
     }
+
+    /// One NDJSON line per event kind cmd_backup's json_out path can emit
+    /// (see commands.py's cmd_backup) — every line must decode and every
+    /// event-specific field must round-trip.
+    func testDecodeEveryProgressEventKind() throws {
+        let lines: [(String, (ProgressEvent) -> Void)] = [
+            (#"{"event": "diff", "added": 2, "changed": 1, "deleted": 0, "touched": 3, "dropzone": 1}"#,
+             { XCTAssertEqual($0.added, 2); XCTAssertEqual($0.dropzone, 1) }),
+            (#"{"event": "chunk_build", "name": "arch-00001.zip", "index": 1, "total": 2, "files": 3}"#,
+             { XCTAssertEqual($0.name, "arch-00001.zip"); XCTAssertEqual($0.files, 3) }),
+            (#"{"event": "sync_upload_start", "count": 5}"#,
+             { XCTAssertEqual($0.count, 5) }),
+            (#"{"event": "sync_file_uploaded", "arcname": "Sync/a.txt", "index": 1, "total": 5}"#,
+             { XCTAssertEqual($0.arcname, "Sync/a.txt") }),
+            (#"{"event": "archive_upload_start"}"#, { _ in }),
+            (#"{"event": "chunk_uploaded", "name": "arch-00001.zip", "index": 1, "total": 1}"#,
+             { XCTAssertEqual($0.name, "arch-00001.zip") }),
+            (#"{"event": "dropzone_trashed", "name": "report.pdf"}"#,
+             { XCTAssertEqual($0.name, "report.pdf") }),
+            (#"{"event": "result", "ok": true, "error": null, "added": 2, "changed": 1, "deleted": 0, "sync_uploaded": 5, "archive_uploaded": 2, "freed_bytes": 1024, "trashed": 1, "waiting": 0}"#,
+             { XCTAssertEqual($0.ok, true); XCTAssertTrue($0.isTerminal); XCTAssertEqual($0.freedBytes, 1024) }),
+            (#"{"event": "result", "ok": false, "error": "quota exceeded", "error_kind": "quota"}"#,
+             { XCTAssertEqual($0.ok, false); XCTAssertEqual($0.errorKind, "quota"); XCTAssertTrue($0.isTerminal) }),
+        ]
+        for (json, check) in lines {
+            let event = try JSONDecoder().decode(ProgressEvent.self, from: Data(json.utf8))
+            check(event)
+        }
+    }
 }
