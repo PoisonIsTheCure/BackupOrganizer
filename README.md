@@ -1,44 +1,68 @@
 # BackupOrganizer
 
-A headless macOS backup manager and smart storage advisor, written in pure-stdlib
-Python. It packs your important directories and an "Archive Dropzone" into
-size-capped zip **chunks**, uploads them to Proton Drive, then deletes the local
-copies to free disk space — and can restore any single file by downloading only
-the one chunk that contains it.
+A macOS backup manager and smart storage advisor: a pure-stdlib Python engine
+(CLI + JSON API) with a native SwiftUI app on top. It treats two kinds of
+folders differently:
+
+- **Synced** folders (`sync_dirs`) upload as **plain files, mirroring the
+  local directory shape** on Proton Drive — no zipping. Deleting a synced
+  file locally never deletes its cloud copy automatically; that's always a
+  deliberate, explicit action (see "Synced folders" below).
+- **Archived** folders (the dropzone) are packed into size-capped zip
+  **chunks**, uploaded, and — only once the remote copy is confirmed — the
+  local original is moved to the Trash. Any single archived file restores by
+  downloading just the one chunk that contains it.
 
 ## Features
 
-- **Chunked backups** — data is packed into ~500 MB zip chunks. A changed file
-  only rebuilds and re-uploads *its own* chunk, never the whole backup; files
-  larger than the cap get a dedicated chunk of their own (never split), and
-  already-compressed formats (video, photos, audio) are stored without
+- **Two storage models, one tool** — synced content mirrors 1:1 to the cloud
+  as plain files; archived content is chunked into zips. See
+  `docs/ARCHITECTURE.md` for the full design and `docs/CONFIGURATION.md` for
+  "Synced folders".
+- **Chunked archiving** — dropzone data is packed into ~500 MB zip chunks;
+  files larger than the cap get a dedicated chunk of their own (never split),
+  and already-compressed formats (video, photos, audio) are stored without
   recompression.
-- **Space freeing by design** — once a chunk's upload is confirmed, the local
-  copy is deleted. Proton Drive is the primary store, not a mirror.
-- **Archive Dropzone** — drop a file (or folder) in; it is packed into a chunk,
-  hash-verified inside the zip, uploaded — and only after the remote copy is
-  confirmed is the original moved to the Trash.
+- **Space freeing by design** — once an archive chunk's upload is confirmed,
+  the local zip is deleted. Sync uploads stream straight from the original
+  file and never touch local disk at all. Proton Drive is the primary store
+  for archived data, not a mirror.
+- **Archive Dropzone** — drop a file (or folder) in; it is packed into a
+  chunk, hash-verified inside the zip, uploaded — and only after the remote
+  copy is confirmed is the original moved to the Trash.
+- **Orphans, not silent deletion** — deleting a synced file locally marks its
+  cloud copy an *orphan* (`--orphans`) rather than deleting it; only an
+  explicit `delete-remote ARCNAME` removes it. Moving something from synced
+  to archived is similarly explicit: `retire-sync-twin` drops the redundant
+  synced copy (local + cloud) once the archived copy is confirmed uploaded —
+  it's never automatic.
 - **Single-file restore** — `--restore invoice.pdf` finds the file in the
-  manifest, downloads just its chunk, extracts and hash-verifies it.
+  manifest (synced or archived) and downloads only what's needed to restore
+  it, then hash-verifies it.
 - **Backup browser** — `--browse` renders the whole backup as an interactive
-  HTML page (collapsible folders, live search, sizes, chunk badges) built
-  purely from the manifest — browsing costs zero downloads. Every folder and
-  file has a ⬇ button that copies the matching restore command to the
-  clipboard. `--tree` prints the same structure in the terminal.
-- **Manifest state tracking** — `manifest.json` records the path, size, mtime,
-  SHA-256 and chunk of every file. Diffing is I/O-efficient: unchanged files
-  cost one `stat()` call, zero reads.
+  HTML page (collapsible folders, live search, sizes, sync/archive badges)
+  built purely from the manifest — browsing costs zero downloads. Every
+  folder and file has a ⬇ button that copies the matching restore command to
+  the clipboard. `--tree` prints the same structure in the terminal.
+- **JSON API** — `--json` on `--status`/`--list`/`--orphans`/`archive`/
+  `add-sync`, plus streaming NDJSON progress on `run --json`. This is what
+  the SwiftUI app talks to; see `mac/BackupOrganizerApp/`.
+- **Manifest state tracking** — `manifest.json` records the path, size,
+  mtime, SHA-256, and upload state of every file. Diffing is I/O-efficient:
+  unchanged files cost one `stat()` call, zero reads.
 - **Storage advisor** — `--advice DIR` reports which files in a directory are
-  byte-identical to an *uploaded* copy (safe to delete) and which are not.
-- **Deduplication** — `--dedupe` finds files stored more than once (by SHA-256)
-  and asks, group by group, which copy to keep. Removed sync copies go to the
-  local Trash; removed archive copies are repacked out of their chunks. Every
-  removal is hash-verified first.
-- **Storage safety** — free-disk-space check before building chunks, remote
-  size confirmation after upload, and classified Proton Drive failures
-  (storage full vs. login expired vs. network).
-- **Native notifications** — every background run ends in a macOS notification
-  (success summary or a specific failure reason).
+  byte-identical to an *uploaded* copy (safe to delete locally) and which
+  are not.
+- **Deduplication** — `--dedupe` finds files stored more than once (by
+  SHA-256) and asks, group by group, which copy to keep. Removed sync copies
+  go to the local Trash (their cloud copy becomes an orphan); removed
+  archive copies are repacked out of their chunks. Every removal is
+  hash-verified first.
+- **Storage safety** — free-disk-space check before building archive chunks,
+  remote size/hash confirmation after every upload, and classified Proton
+  Drive failures (storage full vs. login expired vs. network).
+- **Native notifications** — every background run ends in a macOS
+  notification (success summary or a specific failure reason).
 
 ## Requirements
 
@@ -75,24 +99,32 @@ and upload pipeline works.
 ### Commands
 
 ```sh
-backup-organizer run                     # full cycle: scan, chunk, upload, free space
-backup-organizer archive ~/Movies/old    # move into the dropzone + run the cycle
-backup-organizer add-sync ~/Projects     # add a folder to sync_dirs + run the cycle
+backup-organizer run                             # full cycle: diff, upload sync files, chunk+upload archive
+backup-organizer archive ~/Movies/old            # move into the dropzone + run the cycle
+backup-organizer add-sync ~/Projects             # add a folder to sync_dirs + run the cycle
+backup-organizer delete-remote Sync/Docs/old.md  # permanently delete an orphaned synced file's cloud copy
+backup-organizer retire-sync-twin Archive/a.jpg  # drop the redundant synced copy of an archived file
 ```
 
 `run` is the same as invoking `backup-organizer` with no arguments. `archive`
-takes any number of files/folders, skips the dropzone settle delay (you just
-told it the files are complete), and archiving something from *inside* a sync
-dir is a clean move-to-archive. `add-sync` validates the new folders (must
-exist, unique basenames, no dropzone overlap) before touching the config.
-Both accept `--no-run` to stage only, and honor `--no-upload`.
+takes any number of files/folders and skips the dropzone settle delay (you
+just told it the files are complete). `add-sync` validates the new folders
+(must exist, unique basenames, no dropzone overlap) before touching the
+config. `archive`/`add-sync` accept `--no-run` to stage only, and honor
+`--no-upload`. `delete-remote` and `retire-sync-twin` are deliberately manual
+— see "Synced folders" in `docs/CONFIGURATION.md`.
+
+**Global flags must come before the subcommand** (argparse quirk): write
+`backup-organizer --json run`, not `backup-organizer run --json`.
 
 ### Flags
 
 | Flag | Effect |
 | --- | --- |
-| *(none)* / `run` | Run a backup: build changed chunks, upload, free local space |
-| `--status` | Print file/chunk counts, sizes, pending uploads, last backup/upload |
+| *(none)* / `run` | Run a backup: upload sync files, build+upload changed archive chunks |
+| `--status` | Print file counts, sizes, pending uploads, orphans, last backup/upload |
+| `--list [sync\|archive\|all]` | List backed-up files |
+| `--orphans` | List synced files deleted locally but still in the cloud |
 | `--advice DIR` | Report which files in `DIR` are safely backed up |
 | `--tree [PREFIX]` | Print the backed-up file tree, optionally under a path prefix |
 | `--browse [OUT]` | Generate an interactive HTML backup browser and open it |
@@ -101,13 +133,32 @@ Both accept `--no-run` to stage only, and honor `--no-upload`.
 | `--dedupe [MIN_MB]` | Interactively keep one copy of duplicated files (default: ≥ 1 MB) |
 | `--dest DIR` | Destination for `--restore` (default: `~/Downloads/BackupOrganizer-Restore`) |
 | `--init` | Write a default `config.json` and create the dropzone |
-| `--no-upload` | Build chunks locally only; nothing is deleted or trashed |
+| `--json` | Emit machine-readable JSON (status/list/orphans/archive/add-sync/run and both manual commands) |
+| `--no-upload` | Don't upload; nothing is deleted or trashed |
 | `--dry-run` | Show what would change without writing anything |
 | `--no-notify` | Suppress macOS notifications |
 | `--config PATH` | Use an alternate config file |
 | `--verbose` | Chatty console output |
 
 Exit codes: `0` success, `1` failure, `2` configuration error.
+
+## macOS app
+
+`mac/BackupOrganizerApp/` is a native SwiftUI app — a thin client over the
+CLI's `--json` output, launchable from Launchpad/Spotlight like any other
+Mac app, with a live-updating Dashboard, Synced/Archived browsers, and
+confirmation dialogs for the two deliberate manual actions (delete a synced
+file's cloud copy, retire a synced copy once its archive twin is uploaded).
+No Xcode project needed — it's a Swift Package:
+
+```sh
+cd mac/BackupOrganizerApp
+swift run                    # build + launch for development
+Scripts/build_app.sh         # build the real .app, install to ~/Applications
+```
+
+See `mac/BackupOrganizerApp/README.md` for details (CLI/config path
+overrides, the Gatekeeper right-click-open note for ad-hoc-signed builds).
 
 ## Command-line launcher
 
@@ -174,18 +225,22 @@ Locally (outside the repo), `~/Backups/BackupOrganizer/` holds:
 
 ```
 config.json            your configuration
-sync-00001.zip, ...    chunks being built or awaiting upload (deleted once uploaded)
-manifest.json          state: hashes, sizes, chunk assignments, timestamps
+arch-00001.zip, ...    archive chunks being built or awaiting upload (deleted once uploaded)
+manifest.json          state: hashes, sizes, chunk/upload assignments, orphans, timestamps
 backup_organizer.log   rotating log
 launchd.log            stdout/stderr of scheduled runs
 ```
 
-On Proton Drive, everything sits in one folder (default `/my-files/Backups/MacBookAir`):
+Sync files are never written to local disk beyond the manifest — they upload
+straight from their original location.
+
+On Proton Drive, everything sits under `remote_folder` (default
+`/my-files/Backups/MacBookAir`):
 
 ```
-sync-00001.zip         chunks of the sync directories
-arch-00002.zip         write-once chunks of archived dropzone files
-manifest.json          always the latest state
+Sync/Documents/notes.md   synced files, mirroring the local directory shape 1:1
+arch-00001.zip             write-once chunks of archived dropzone files
+manifest.json               always the latest state
 ```
 
 ## License
