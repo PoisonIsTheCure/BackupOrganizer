@@ -1,4 +1,16 @@
+import AppKit
 import SwiftUI
+
+/// Drag-to-select-then-⌘C is unreliable inside scrolling monospaced text in
+/// SwiftUI (this is exactly what prompted adding these buttons — a user
+/// couldn't get a failing command's output out of the app any other way).
+/// An explicit button is the robust path; .textSelection(.enabled) stays on
+/// as a secondary option for whoever prefers dragging.
+func copyToClipboard(_ text: String) {
+    let pasteboard = NSPasteboard.general
+    pasteboard.clearContents()
+    pasteboard.setString(text, forType: .string)
+}
 
 /// Two independent histories, both aimed at "why did that fail":
 /// - App Commands: every CLI invocation this app made this session, exactly
@@ -158,7 +170,18 @@ struct ActivityView: View {
     @ViewBuilder
     private var backendLogSection: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("Backend Log").font(.headline)
+            HStack {
+                Text("Backend Log").font(.headline)
+                Spacer()
+                if case .loaded(let tail) = logTailState, !tail.lines.isEmpty {
+                    Button {
+                        copyToClipboard(tail.lines.joined(separator: "\n"))
+                    } label: {
+                        Label("Copy Log", systemImage: "doc.on.doc")
+                    }
+                    .font(.caption)
+                }
+            }
             switch logTailState {
             case .loading:
                 ProgressView()
@@ -183,6 +206,7 @@ struct ActivityView: View {
                                     .foregroundStyle(line.contains(" ERROR ") || line.contains(" WARNING ")
                                                      ? .orange : .primary)
                                     .fixedSize(horizontal: true, vertical: false)
+                                    .textSelection(.enabled)
                             }
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -209,6 +233,15 @@ private struct CommandRecordRow: View {
     let record: CommandRecord
     @State private var expanded = false
 
+    private var copyText: String {
+        var parts = ["$ \(record.command)"]
+        if let exitCode = record.exitCode { parts.append("exit \(exitCode)") }
+        if let launchError = record.launchError { parts.append("launch error: \(launchError)") }
+        if !record.stdout.isEmpty { parts.append("stdout:\n\(record.stdout)") }
+        if !record.stderr.isEmpty { parts.append("stderr:\n\(record.stderr)") }
+        return parts.joined(separator: "\n\n")
+    }
+
     var body: some View {
         DisclosureGroup(isExpanded: $expanded) {
             VStack(alignment: .leading, spacing: 6) {
@@ -225,6 +258,12 @@ private struct CommandRecordRow: View {
                     Text(record.stderr).font(.caption.monospaced())
                         .foregroundStyle(.red).textSelection(.enabled)
                 }
+                Button {
+                    copyToClipboard(copyText)
+                } label: {
+                    Label("Copy", systemImage: "doc.on.doc")
+                }
+                .font(.caption)
             }
             .padding(.top, 4)
         } label: {

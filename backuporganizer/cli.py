@@ -10,7 +10,7 @@ from pathlib import Path
 from .commands import (cmd_add_sync, cmd_advice, cmd_archive, cmd_backup,
                        cmd_dedupe, cmd_delete_remote, cmd_init, cmd_list,
                        cmd_log_tail, cmd_orphans, cmd_recalculate_manifest,
-                       cmd_restore, cmd_retire_sync_twin, cmd_status)
+                       cmd_remove_sync, cmd_restore, cmd_retire_sync_twin, cmd_status)
 from .config import DEFAULT_CONFIG_PATH, Config, ConfigError
 from .util import APP_NAME, BackupError, log, notify, setup_logging
 from .viewer import cmd_browse, cmd_tree
@@ -72,6 +72,10 @@ def build_parser() -> argparse.ArgumentParser:
     addsync_p.add_argument("dirs", nargs="+", type=Path, metavar="DIR")
     addsync_p.add_argument("--no-run", action="store_true",
                            help="only update the config; back up on the next run")
+    removesync_p = sub.add_parser(
+        "remove-sync",
+        help="stop syncing folder(s); their cloud copies become orphans, kept until deleted-remote")
+    removesync_p.add_argument("dirs", nargs="+", type=Path, metavar="DIR")
     del_p = sub.add_parser(
         "delete-remote", help="permanently delete the cloud copy of an orphaned synced file")
     del_p.add_argument("arcnames", nargs="+", metavar="ARCNAME")
@@ -143,6 +147,12 @@ def main(argv: list[str] | None = None) -> int:
                 return cmd_add_sync(args.config, args.dirs, run=not args.no_run,
                                     do_upload=not args.no_upload,
                                     notify_enabled=notify_enabled, json_out=args.json)
+            except ConfigError as exc:
+                print(f"Config error: {exc}", file=sys.stderr)
+                return 2
+        if args.command == "remove-sync":
+            try:
+                return cmd_remove_sync(args.config, args.dirs, json_out=args.json)
             except ConfigError as exc:
                 print(f"Config error: {exc}", file=sys.stderr)
                 return 2

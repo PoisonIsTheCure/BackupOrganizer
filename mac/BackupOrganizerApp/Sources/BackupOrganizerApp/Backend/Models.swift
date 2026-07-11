@@ -16,6 +16,7 @@ struct StatusInfo: Codable, Equatable {
     var dropzonePending: Int
     var remoteFolder: String
     var logPath: String?
+    var syncDirs: [String]?
 
     enum CodingKeys: String, CodingKey {
         case filesTotal = "files_total"
@@ -32,6 +33,7 @@ struct StatusInfo: Codable, Equatable {
         case dropzonePending = "dropzone_pending"
         case remoteFolder = "remote_folder"
         case logPath = "log_path"
+        case syncDirs = "sync_dirs"
     }
 }
 
@@ -217,6 +219,18 @@ struct AddSyncResult: Codable, Equatable {
         case added, skipped
         case stagedOnly = "staged_only"
         case backupExitCode = "backup_exit_code"
+    }
+}
+
+/// Result of `remove-sync DIR... --json`.
+struct RemoveSyncResult: Codable, Equatable {
+    var removed: [String]
+    var notFound: [String]
+    var orphaned: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case removed, orphaned
+        case notFound = "not_found"
     }
 }
 

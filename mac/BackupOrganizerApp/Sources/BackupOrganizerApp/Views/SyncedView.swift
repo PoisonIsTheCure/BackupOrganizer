@@ -2,10 +2,13 @@ import SwiftUI
 
 struct SyncedView: View {
     let client: BackendClient
+    @State private var syncDirsState: LoadState<[String]> = .loading
     @State private var filesState: LoadState<[FileEntry]> = .loading
     @State private var orphansState: LoadState<[OrphanEntry]> = .loading
     @State private var pendingDelete: OrphanEntry?
     @State private var deletingArcname: String?
+    @State private var pendingRemoveDir: String?
+    @State private var removingDir: String?
     @State private var actionError: String?
 
     var body: some View {
@@ -13,6 +16,7 @@ struct SyncedView: View {
             header
             Divider()
             List {
+                syncDirsSection
                 orphansSection
                 filesSection
             }
@@ -22,7 +26,21 @@ struct SyncedView: View {
         .confirmDeleteRemote(orphan: $pendingDelete) { orphan in
             Task { await deleteRemote(orphan) }
         }
-        .alert("Couldn't delete from the cloud", isPresented: Binding(
+        .confirmationDialog(
+            "Stop syncing this folder?",
+            isPresented: Binding(get: { pendingRemoveDir != nil }, set: { if !$0 { pendingRemoveDir = nil } }),
+            presenting: pendingRemoveDir
+        ) { dir in
+            Button("Stop Syncing", role: .destructive) {
+                Task { await removeSync(dir) }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: { dir in
+            Text("\(dir)\n\nThis folder stops being watched for changes. Its files already on "
+                + "the cloud become orphans — kept there until you manually delete them (see "
+                + "the orphans list below). Nothing local is deleted.")
+        }
+        .alert("Couldn't complete that action", isPresented: Binding(
             get: { actionError != nil }, set: { if !$0 { actionError = nil } }
         )) {
             Button("OK", role: .cancel) {}
@@ -35,6 +53,7 @@ struct SyncedView: View {
         HStack {
             Text("Synced").font(.title2.bold())
             Spacer()
+            AddSyncButton(client: client) { Task { await loadAll() } }
             Button {
                 Task { await loadAll() }
             } label: {
@@ -42,6 +61,41 @@ struct SyncedView: View {
             }
         }
         .padding()
+    }
+
+    // MARK: - Synced folders
+
+    @ViewBuilder
+    private var syncDirsSection: some View {
+        switch syncDirsState {
+        case .loading:
+            Section("Synced Folders") { ProgressView() }
+        case .failed(let message):
+            Section("Synced Folders") { Text(message).foregroundStyle(.secondary) }
+        case .loaded(let dirs):
+            Section("Synced Folders (\(dirs.count))") {
+                if dirs.isEmpty {
+                    Text("No folders configured — use Add Sync Folder above.")
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(dirs, id: \.self) { dir in
+                        HStack {
+                            Image(systemName: "folder.fill").foregroundStyle(.secondary)
+                            Text(dir).font(.body.monospaced())
+                            Spacer()
+                            if removingDir == dir {
+                                ProgressView().controlSize(.small)
+                            } else {
+                                Button("Stop Syncing", role: .destructive) {
+                                    pendingRemoveDir = dir
+                                }
+                                .disabled(removingDir != nil)
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     @ViewBuilder
@@ -100,9 +154,19 @@ struct SyncedView: View {
     }
 
     private func loadAll() async {
+        async let dirs: () = loadSyncDirs()
         async let files: () = loadFiles()
         async let orphans: () = loadOrphans()
-        _ = await (files, orphans)
+        _ = await (dirs, files, orphans)
+    }
+
+    private func loadSyncDirs() async {
+        syncDirsState = .loading
+        do {
+            syncDirsState = .loaded(try await client.status().syncDirs ?? [])
+        } catch {
+            syncDirsState = .failed(error.localizedDescription)
+        }
     }
 
     private func loadFiles() async {
@@ -134,6 +198,20 @@ struct SyncedView: View {
                 actionError = "\(orphan.arcname) is no longer an orphan (it may have reappeared locally)."
             }
             await loadOrphans()
+        } catch {
+            actionError = error.localizedDescription
+        }
+    }
+
+    private func removeSync(_ dir: String) async {
+        removingDir = dir
+        defer { removingDir = nil }
+        do {
+            let result = try await client.removeSync(dirs: [dir])
+            if !result.notFound.isEmpty {
+                actionError = "\(dir) wasn't a configured sync folder (already removed?)."
+            }
+            await loadAll()
         } catch {
             actionError = error.localizedDescription
         }

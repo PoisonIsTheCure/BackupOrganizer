@@ -131,6 +131,12 @@ actor BackendClient {
         return try await runJSON(args)
     }
 
+    /// Stops syncing folder(s): removes them from sync_dirs and orphans
+    /// their tracked cloud copies (kept until a manual delete-remote).
+    func removeSync(dirs: [String]) async throws -> RemoveSyncResult {
+        try await runJSON(["--json", "--no-notify", "remove-sync"] + dirs)
+    }
+
     func deleteRemote(arcnames: [String]) async throws -> DeleteRemoteResult {
         try await runJSON(["--json", "--no-notify", "delete-remote"] + arcnames)
     }

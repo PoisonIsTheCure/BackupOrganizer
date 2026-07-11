@@ -13,13 +13,36 @@ final class ModelsTests: XCTestCase {
          "orphans_pending": 1, "local_cache_bytes": 0,
          "last_backup": "2026-07-11T21:00:00+02:00",
          "last_upload": "2026-07-11T21:02:00+02:00",
-         "dropzone_pending": 0, "remote_folder": "/my-files/Backups/MacBookAir"}
+         "dropzone_pending": 0, "remote_folder": "/my-files/Backups/MacBookAir",
+         "sync_dirs": ["/Users/you/Documents/Sync", "/Users/you/Desktop"]}
         """
         let status = try JSONDecoder().decode(StatusInfo.self, from: Data(json.utf8))
         XCTAssertEqual(status.filesTotal, 42)
         XCTAssertEqual(status.syncCount, 30)
         XCTAssertEqual(status.chunksPending, ["arch-00003.zip"])
         XCTAssertEqual(status.remoteFolder, "/my-files/Backups/MacBookAir")
+        XCTAssertEqual(status.syncDirs, ["/Users/you/Documents/Sync", "/Users/you/Desktop"])
+    }
+
+    func testDecodeStatusInfoWithoutSyncDirsDefaultsToEmpty() throws {
+        let json = """
+        {"files_total": 0, "sync_count": 0, "archive_count": 0, "total_bytes": 0,
+         "chunks_total": 0, "chunks_pending": [], "sync_pending": 0, "orphans_pending": 0,
+         "local_cache_bytes": 0, "last_backup": "", "last_upload": "", "dropzone_pending": 0,
+         "remote_folder": "/my-files/x"}
+        """
+        let status = try JSONDecoder().decode(StatusInfo.self, from: Data(json.utf8))
+        XCTAssertNil(status.syncDirs)
+    }
+
+    func testDecodeRemoveSyncResult() throws {
+        let json = """
+        {"removed": ["/Users/you/Documents/Sync"], "not_found": [],
+         "orphaned": ["Sync/Documents/a.txt", "Sync/Documents/b.txt"]}
+        """
+        let result = try JSONDecoder().decode(RemoveSyncResult.self, from: Data(json.utf8))
+        XCTAssertEqual(result.removed, ["/Users/you/Documents/Sync"])
+        XCTAssertEqual(result.orphaned.count, 2)
     }
 
     func testDecodeSyncFileEntryHasNoArchiveOnlyFields() throws {

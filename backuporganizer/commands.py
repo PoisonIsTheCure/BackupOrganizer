@@ -223,6 +223,7 @@ def cmd_status(cfg: Config, json_out: bool = False) -> int:
             "last_upload": manifest.last_upload, "dropzone_pending": pending,
             "remote_folder": cfg.remote_folder,
             "log_path": str(cfg.backup_dir / "backup_organizer.log"),
+            "sync_dirs": [str(d) for d in cfg.sync_dirs],
         }))
         return 0
 
@@ -929,6 +930,63 @@ def cmd_add_sync(config_path: Path, dirs: list[Path], run: bool, do_upload: bool
         print(json.dumps({"added": [str(p) for p in added], "skipped": skipped,
                           "staged_only": False, "backup_exit_code": rc}))
     return rc
+
+
+def cmd_remove_sync(config_path: Path, dirs: list[Path], json_out: bool = False) -> int:
+    """Stop syncing folder(s): removes them from sync_dirs and orphans every
+    currently-tracked cloud copy under them — exactly as if each file had
+    been deleted locally, since nothing here is watched for changes from
+    this point on. Cloud copies are kept until a manual delete-remote, same
+    as any other synced-file deletion; nothing is uploaded, downloaded, or
+    deleted here.
+    """
+    raw = json.loads(config_path.read_text())
+    current = [str(Path(d).expanduser()) for d in raw.get("sync_dirs", [])]
+    to_remove: list[str] = []
+    not_found: list[str] = []
+    for d in dirs:
+        p = str(d.expanduser())
+        (to_remove if p in current else not_found).append(p)
+    if not to_remove:
+        result = {"removed": [], "not_found": not_found, "orphaned": []}
+        if json_out:
+            print(json.dumps(result))
+        else:
+            print("Not a configured sync folder, nothing removed.", file=sys.stderr)
+        return 1
+
+    remaining = [d for d in current if d not in to_remove]
+    candidate = dict(raw)
+    candidate["sync_dirs"] = remaining
+    cfg = Config.from_raw(candidate)  # validated even though a removal can't reintroduce collisions
+
+    manifest = Manifest.load(cfg.manifest_path)
+    removed_basenames = {Path(p).name for p in to_remove}
+    orphaned: list[str] = []
+    for arc, entry in list(manifest.files.items()):
+        if entry.get("source") != "sync":
+            continue
+        parts = arc.split("/", 2)
+        if len(parts) < 2 or parts[0] != "Sync" or parts[1] not in removed_basenames:
+            continue
+        del manifest.files[arc]
+        manifest.deleted_sync[arc] = {
+            "size": entry["size"], "sha256": entry["sha256"],
+            "origin": entry["origin"], "deleted_at": now_iso(),
+        }
+        orphaned.append(arc)
+    manifest.save()
+
+    config_path.write_text(json.dumps(candidate, indent=2) + "\n")
+    result = {"removed": to_remove, "not_found": not_found, "orphaned": orphaned}
+    if json_out:
+        print(json.dumps(result))
+    else:
+        for p in to_remove:
+            print(f"Stopped syncing: {p}")
+        if orphaned:
+            print(f"{len(orphaned)} cloud cop(ies) kept as orphans — see --orphans / delete-remote.")
+    return 0
 
 
 def cmd_init(config_path: Path) -> int:
