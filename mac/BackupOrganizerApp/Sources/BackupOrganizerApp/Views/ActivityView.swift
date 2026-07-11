@@ -81,16 +81,23 @@ struct ActivityView: View {
                 if tail.lines.isEmpty {
                     Text("Log is empty.").foregroundStyle(.secondary)
                 } else {
-                    ScrollView(.horizontal) {
-                        VStack(alignment: .leading, spacing: 2) {
+                    // Scrolling both axes, with each line forced to its
+                    // natural (unwrapped) size: a horizontal-only ScrollView
+                    // around a vertical stack of Text doesn't give the
+                    // stack a real height to lay out against, so lines
+                    // collapse and render on top of each other instead of
+                    // stacking — .fixedSize + both-axis scrolling fixes it.
+                    ScrollView([.horizontal, .vertical]) {
+                        LazyVStack(alignment: .leading, spacing: 2) {
                             ForEach(Array(tail.lines.enumerated()), id: \.offset) { _, line in
                                 Text(line)
                                     .font(.caption.monospaced())
                                     .foregroundStyle(line.contains(" ERROR ") || line.contains(" WARNING ")
                                                      ? .orange : .primary)
-                                    .lineLimit(1)
+                                    .fixedSize(horizontal: true, vertical: false)
                             }
                         }
+                        .frame(maxWidth: .infinity, alignment: .leading)
                     }
                     .frame(maxHeight: 320)
                     .padding(8)

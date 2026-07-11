@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable
 
@@ -242,6 +243,12 @@ def upload_pending(cfg: Config, manifest: Manifest, trash_remote: list[str],
     return uploaded, freed, error
 
 
+CONFIRM_WORKERS = 4  # confirm_remote is one subprocess per file, almost pure
+                     # network wait — safe to run several at once; the actual
+                     # uploads stay sequential (bandwidth-bound, not helped
+                     # by concurrency the way a metadata check is).
+
+
 def upload_sync_files(cfg: Config, manifest: Manifest,
                       on_progress: Callable[[dict], None] | None = None,
                       ) -> tuple[int, UploadError | None]:
@@ -251,12 +258,16 @@ def upload_sync_files(cfg: Config, manifest: Manifest,
 
     Scans manifest.files for source=="sync" entries with no `uploaded`
     timestamp (same resumable pattern as upload_pending's chunk scan), groups
-    them by remote parent directory, and uploads each group in one CLI call,
-    then confirms each file individually (the CLI's `info` command takes
-    exactly one path). A failure stops the loop but keeps every
-    already-confirmed upload's manifest entry saved. on_progress, if given,
-    is called with a JSON-serializable dict after every confirmed file
-    upload (for `run --json` NDJSON streaming).
+    them by remote parent directory, and uploads each group in one CLI call
+    (sequential — bandwidth-bound). Confirmation (the CLI's `info` command,
+    one process per file, no batch form) runs on a small thread pool since
+    it's I/O wait, not CPU or bandwidth, and dominates wall time once there
+    are thousands of files. Manifest mutation, saving, and progress events
+    all happen back on the calling thread as each confirm completes — the
+    worker threads only ever hash a file and shell out to `info`, never touch
+    shared state, so no locking is needed. A failure stops new confirms from
+    starting (in-flight ones are allowed to finish) but keeps every
+    already-confirmed upload's manifest entry saved.
     """
     error: UploadError | None = None
     uploaded = 0
@@ -268,6 +279,13 @@ def upload_sync_files(cfg: Config, manifest: Manifest,
     if not members:
         return uploaded, error
     total = len(members)
+
+    def confirm_one(m: Member) -> tuple[Member, bool]:
+        with open(m.origin, "rb") as fh:
+            local_sha1 = hashlib.file_digest(fh, "sha1").hexdigest()
+        ok = confirm_remote(cfg, cfg.remote_path(m.arcname), m.size, local_sha1)
+        return m, ok
+
     try:
         ensure_remote_folder(cfg)
         groups: dict[str, list[Member]] = {}
@@ -280,11 +298,13 @@ def upload_sync_files(cfg: Config, manifest: Manifest,
             group = groups[parent]
             log.info("Uploading %d sync file(s) to %s ...", len(group), parent)
             upload_files(cfg, [m.origin for m in group], parent)
-            for m in group:
-                with open(m.origin, "rb") as fh:
-                    local_sha1 = hashlib.file_digest(fh, "sha1").hexdigest()
-                remote_path = cfg.remote_path(m.arcname)
-                if not confirm_remote(cfg, remote_path, m.size, local_sha1):
+
+        pool = ThreadPoolExecutor(max_workers=CONFIRM_WORKERS)
+        try:
+            futures = [pool.submit(confirm_one, m) for group in groups.values() for m in group]
+            for future in as_completed(futures):
+                m, ok = future.result()
+                if not ok:
                     raise UploadError("error", f"remote verification failed for {m.arcname}")
                 manifest.files[m.arcname] = m.to_entry_sync(uploaded=now_iso())
                 uploaded += 1
@@ -292,6 +312,8 @@ def upload_sync_files(cfg: Config, manifest: Manifest,
                 if on_progress:
                     on_progress({"event": "sync_file_uploaded", "arcname": m.arcname,
                                 "index": uploaded, "total": total})
+        finally:
+            pool.shutdown(wait=True, cancel_futures=True)
     except UploadError as exc:
         error = exc
     except (OSError, subprocess.TimeoutExpired) as exc:
