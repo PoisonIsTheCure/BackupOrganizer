@@ -16,3 +16,8 @@ __pycache__/
 
 # Visual Studio Code
 .vscode/
+
+# Swift Package Manager / built app bundle (build locally, see mac/BackupOrganizerApp/README.md)
+mac/BackupOrganizerApp/.build/
+mac/BackupOrganizerApp/*.app
+.swiftpm/

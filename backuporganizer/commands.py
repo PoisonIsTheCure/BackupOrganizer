@@ -211,15 +211,19 @@ def cmd_list(cfg: Config, kind: str, json_out: bool = False) -> int:
             continue
         if kind == "archive" and source != "dropzone":
             continue
+        # "uploaded" is always an ISO timestamp string when uploaded, "" when
+        # pending — same type for sync and archive rows, so callers (the
+        # Swift JSON decoder) don't need a union type for one field.
         row = {"arcname": arc, "size": e["size"], "sha256": e["sha256"], "source": source}
         if source == "sync":
             row["uploaded"] = e.get("uploaded", "")
         else:
             row["chunk"] = e.get("chunk", "")
-            row["uploaded"] = bool(manifest.chunks.get(e.get("chunk", ""), {}).get("uploaded"))
+            chunk_uploaded = manifest.chunks.get(e.get("chunk", ""), {}).get("uploaded", "")
+            row["uploaded"] = chunk_uploaded
             twins = find_sync_twins(manifest, arc)
             row["relocatable"] = bool(twins)
-            row["twin_confirmed"] = row["uploaded"]
+            row["twin_confirmed"] = bool(chunk_uploaded)
         entries.append(row)
     if json_out:
         print(json.dumps(entries))
