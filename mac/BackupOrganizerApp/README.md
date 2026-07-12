@@ -46,6 +46,16 @@ Re-running `build_app.sh` is safe — it only ever touches its own `dist/`
 output and `~/Applications/BackupOrganizer.app` (or `/Applications/...`
 with the flag), overwriting the previous build each time.
 
+## Rebuilding while the app is running
+
+`build_app.sh` alone doesn't touch a running instance or relaunch anything.
+For the edit → rebuild → see-it-live loop:
+
+```sh
+Scripts/rebuild.sh                 # quit, rebuild, reinstall, relaunch — one command
+Scripts/rebuild.sh --applications  # same, but installs to /Applications
+```
+
 ## What's not here (yet)
 
 A Settings screen for editing `config.json` fields (sync_dirs, exclude
