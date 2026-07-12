@@ -188,6 +188,28 @@ def invalidate_remote_dir(manifest: Manifest, path: str) -> None:
     ]
 
 
+def invalidate_remote_dir_chain(cfg: Config, manifest: Manifest, path: str) -> None:
+    """Like invalidate_remote_dir, but for path's *entire* ancestor chain,
+    not just path itself.
+
+    Uploading into a deeply nested folder can fail with "Node not found:
+    X" where X is some ancestor several levels up, not the folder we were
+    directly trying to use — e.g. uploading into ".../JobSearch/CVs" fails
+    because "JobSearch" isn't really there. Invalidating only the leaf
+    (".../JobSearch/CVs") leaves the wrong cache entry for "JobSearch" in
+    place, so the retry just tries to recreate "CVs" under a parent that
+    still isn't there and fails the same way again. Invalidating the whole
+    chain forces every level to be re-verified/recreated from scratch —
+    the ones that are genuinely fine no-op instantly ("already exists"),
+    the one that's actually missing (wherever it is) gets recreated.
+    """
+    parts = [p for p in path[len(cfg.remote_folder):].strip("/").split("/") if p]
+    parent = cfg.remote_folder
+    for part in parts:
+        parent = parent.rstrip("/") + "/" + part
+        invalidate_remote_dir(manifest, parent)
+
+
 def upload_file(cfg: Config, local: Path, remote_parent: str | None = None) -> None:
     """Upload one file into remote_parent (default remote_folder), replacing
     any previous version."""
@@ -420,10 +442,14 @@ def upload_sync_files(cfg: Config, manifest: Manifest,
                 # remote_dirs) but the cloud says otherwise — recreate it
                 # and retry once rather than failing the whole run. This is
                 # the self-healing case: the manifest is only ever a cache
-                # of the cloud's state, not a substitute for it.
-                log.warning("Upload to %s failed (%s); recreating the folder and retrying once.",
+                # of the cloud's state, not a substitute for it. The error
+                # can name *any* ancestor (e.g. uploading into ".../A/B"
+                # failing because "A" isn't really there, not "B") — so the
+                # whole chain gets invalidated, not just the immediate
+                # folder we were uploading into.
+                log.warning("Upload to %s failed (%s); recreating the folder chain and retrying once.",
                            parent, exc)
-                invalidate_remote_dir(manifest, parent)
+                invalidate_remote_dir_chain(cfg, manifest, parent)
                 ensure_remote_dirs(cfg, manifest, {parent})
                 upload_files(cfg, [m.origin for m in group], parent)
             uploaded_groups.append(parent)

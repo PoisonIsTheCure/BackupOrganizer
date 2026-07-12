@@ -232,6 +232,59 @@ class UploadSyncFilesGroupingTest(unittest.TestCase):
             self.assertTrue(manifest.files["Sync/Documents/a.txt"]["uploaded"])
             self.assertFalse(manifest.files["Sync/Other/b.txt"]["uploaded"])  # untouched, resumable
 
+    def test_error_naming_an_ancestor_invalidates_the_whole_chain(self):
+        # Regression test for the "Node not found: JobSearch" bug: uploading
+        # into ".../JobSearch/CVs" fails because "JobSearch" (its parent,
+        # not "CVs" itself) isn't really there, even though the cache
+        # wrongly believes "JobSearch" exists. The old self-heal only
+        # invalidated "CVs" (the folder we were directly uploading into),
+        # leaving the wrong "JobSearch" cache entry in place — so the retry
+        # just tried to recreate "CVs" under a parent that still didn't
+        # exist and failed the exact same way again. It must invalidate
+        # the whole ancestor chain so "JobSearch" gets recreated too.
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            cfg = make_config(tmp)
+            manifest = Manifest(path=tmp / "manifest.json")
+            # "JobSearch" is wrongly cached as already existing.
+            manifest.remote_dirs = [
+                cfg.remote_path("Sync"), cfg.remote_path("Sync/Documents"),
+                cfg.remote_path("Sync/Documents/JobSearch"),
+            ]
+
+            origin = tmp / "resume.pdf"
+            origin.write_text("hello")
+            st = origin.stat()
+            member = Member("Sync/Documents/JobSearch/CVs/resume.pdf", origin,
+                            st.st_size, st.st_mtime_ns, sha256="x")
+            manifest.files["Sync/Documents/JobSearch/CVs/resume.pdf"] = member.to_entry_sync(uploaded="")
+
+            upload_attempts = 0
+            created_folders: list[str] = []
+
+            def fake(cfg_, *args, **kwargs):
+                nonlocal upload_attempts
+                if args[:2] == ("filesystem", "upload"):
+                    upload_attempts += 1
+                    if upload_attempts == 1:
+                        return fake_proc(returncode=1, stderr="Node not found: JobSearch")
+                    return fake_proc()
+                if args[:2] == ("filesystem", "create-folder"):
+                    created_folders.append(args[3])
+                return fake_proc()
+
+            with mock.patch.object(proton_mod, "proton", side_effect=fake):
+                uploaded, error = proton_mod.upload_sync_files(cfg, manifest)
+
+            self.assertIsNone(error)
+            self.assertEqual(uploaded, 1)
+            self.assertEqual(upload_attempts, 2)
+            # the whole chain was rebuilt, not just the leaf "CVs"
+            self.assertIn("JobSearch", created_folders)
+            self.assertIn("CVs", created_folders)
+            self.assertTrue(
+                manifest.files["Sync/Documents/JobSearch/CVs/resume.pdf"]["uploaded"])
+
     def test_missing_folder_is_recreated_and_upload_retried(self):
         # Regression test for the "Node not found: Documents" bug: the
         # manifest's remote_dirs cache believed a folder existed (as it
