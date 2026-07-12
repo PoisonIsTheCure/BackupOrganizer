@@ -40,7 +40,9 @@ class RecalculateManifestTest(unittest.TestCase):
             (docs / "recovered.txt").write_bytes(b"aaaaa")   # 5 bytes
             (docs / "confirmed.txt").write_bytes(b"bbbbb")   # 5 bytes
             (docs / "mismatch.txt").write_bytes(b"ccccc")    # 5 bytes locally
-            # "nolocal.txt" and "orphan_still_there.txt" deliberately not created
+            (docs / "stale_but_local.txt").write_bytes(b"ddddd")  # 5 bytes locally
+            # "stale_gone_both.txt", "nolocal.txt" and "orphan_still_there.txt"
+            # deliberately not created locally
 
             cfg = make_config(tmp, sync_dirs=[str(docs)])
             manifest = Manifest(path=tmp / "backup" / "manifest.json")
@@ -55,10 +57,17 @@ class RecalculateManifestTest(unittest.TestCase):
                 "size": 5, "mtime_ns": 1, "sha256": "x", "source": "sync",
                 "origin": str(docs / "mismatch.txt"), "uploaded": "2026-01-01T00:00:00+00:00",
             }
-            # stale_cleared: tracked, marked uploaded, but absent from the remote listing entirely
-            manifest.files["Sync/Documents/stale.txt"] = {
+            # stale_cleared: tracked, marked uploaded, absent from remote, but the local
+            # original still exists -> reset to pending, the next run re-uploads it
+            manifest.files["Sync/Documents/stale_but_local.txt"] = {
                 "size": 5, "mtime_ns": 1, "sha256": "x", "source": "sync",
-                "origin": str(docs / "stale.txt"), "uploaded": "2026-01-01T00:00:00+00:00",
+                "origin": str(docs / "stale_but_local.txt"), "uploaded": "2026-01-01T00:00:00+00:00",
+            }
+            # removed_gone_from_both: tracked, marked uploaded, absent from remote AND
+            # the local original is also gone -> nothing to preserve, remove outright
+            manifest.files["Sync/Documents/stale_gone_both.txt"] = {
+                "size": 5, "mtime_ns": 1, "sha256": "x", "source": "sync",
+                "origin": str(docs / "stale_gone_both.txt"), "uploaded": "2026-01-01T00:00:00+00:00",
             }
             # orphan still on the remote -> must survive untouched
             manifest.deleted_sync["Sync/Documents/orphan_still_there.txt"] = {
@@ -122,9 +131,12 @@ class RecalculateManifestTest(unittest.TestCase):
             self.assertTrue(manifest.files["Sync/Documents/mismatch.txt"]["uploaded"])
             self.assertEqual(manifest.files["Sync/Documents/mismatch.txt"]["size"], 5)
 
-            # stale_cleared: reset to pending, not deleted outright
-            self.assertIn("Sync/Documents/stale.txt", manifest.files)
-            self.assertEqual(manifest.files["Sync/Documents/stale.txt"]["uploaded"], "")
+            # stale_cleared: reset to pending, not deleted outright (local original exists)
+            self.assertIn("Sync/Documents/stale_but_local.txt", manifest.files)
+            self.assertEqual(manifest.files["Sync/Documents/stale_but_local.txt"]["uploaded"], "")
+
+            # removed_gone_from_both: fully removed, not left dangling as "pending forever"
+            self.assertNotIn("Sync/Documents/stale_gone_both.txt", manifest.files)
 
             # orphans
             self.assertIn("Sync/Documents/orphan_still_there.txt", manifest.deleted_sync)

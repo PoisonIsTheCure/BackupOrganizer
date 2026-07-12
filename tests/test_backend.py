@@ -83,6 +83,72 @@ class EnsureRemoteDirsTest(unittest.TestCase):
                 )
                 self.assertEqual(calls, [])  # nothing new to create
 
+    def test_real_create_folder_failure_raises_and_is_not_marked_known(self):
+        # Regression test: a create-folder failure that ISN'T "already
+        # exists" used to be silently logged and the path marked known
+        # anyway — every later call needing that folder as a parent then
+        # failed with a confusing "Node not found" instead of the real
+        # reason, and the broken path was never retried on a later run.
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_config(Path(tmp))
+            manifest = Manifest(path=Path(tmp) / "manifest.json")
+            calls = 0
+
+            def fake(cfg_, *args, **kwargs):
+                nonlocal calls
+                if args[:2] == ("filesystem", "create-folder") and args[3] == "Documents":
+                    calls += 1
+                    return fake_proc(returncode=1, stderr="internal server error")
+                return fake_proc()
+
+            with mock.patch.object(proton_mod, "proton", side_effect=fake), \
+                 mock.patch.object(proton_mod.time, "sleep"):
+                with self.assertRaises(proton_mod.UploadError) as ctx:
+                    proton_mod.ensure_remote_dirs(
+                        cfg, manifest, {cfg.remote_path("Sync/Documents/Sub")}
+                    )
+            self.assertIn("Documents", str(ctx.exception))
+            self.assertEqual(calls, proton_mod.CREATE_FOLDER_RETRIES)  # retried, then gave up
+            self.assertNotIn(cfg.remote_path("Sync/Documents"), manifest.remote_dirs)
+            self.assertNotIn(cfg.remote_path("Sync/Documents/Sub"), manifest.remote_dirs)
+
+    def test_create_folder_succeeds_after_transient_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_config(Path(tmp))
+            manifest = Manifest(path=Path(tmp) / "manifest.json")
+            attempts = 0
+
+            def fake(cfg_, *args, **kwargs):
+                nonlocal attempts
+                if args[:2] == ("filesystem", "create-folder") and args[3] == "Documents":
+                    attempts += 1
+                    if attempts < 2:
+                        return fake_proc(returncode=1, stderr="temporary hiccup")
+                    return fake_proc()
+                return fake_proc()
+
+            with mock.patch.object(proton_mod, "proton", side_effect=fake), \
+                 mock.patch.object(proton_mod.time, "sleep"):
+                proton_mod.ensure_remote_dirs(cfg, manifest, {cfg.remote_path("Sync/Documents")})
+            self.assertEqual(attempts, 2)
+            self.assertIn(cfg.remote_path("Sync/Documents"), manifest.remote_dirs)
+
+    def test_already_exists_failure_is_not_fatal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_config(Path(tmp))
+            manifest = Manifest(path=Path(tmp) / "manifest.json")
+
+            def fake(cfg_, *args, **kwargs):
+                if args[:2] == ("filesystem", "create-folder"):
+                    return fake_proc(returncode=1, stderr="folder already exists")
+                return fake_proc()
+
+            with mock.patch.object(proton_mod, "proton", side_effect=fake):
+                proton_mod.ensure_remote_dirs(
+                    cfg, manifest, {cfg.remote_path("Sync/Documents")}
+                )
+            self.assertIn(cfg.remote_path("Sync/Documents"), manifest.remote_dirs)
+
 
 class UploadSyncFilesGroupingTest(unittest.TestCase):
     def test_batches_by_remote_parent_directory(self):
@@ -120,6 +186,73 @@ class UploadSyncFilesGroupingTest(unittest.TestCase):
             self.assertEqual(len(upload_calls), 3)
             for arc in files:
                 self.assertTrue(manifest.files[arc]["uploaded"])
+
+    def test_missing_folder_is_recreated_and_upload_retried(self):
+        # Regression test for the "Node not found: Documents" bug: the
+        # manifest's remote_dirs cache believed a folder existed (as it
+        # would after the old create-folder bug, or if someone deleted it
+        # by hand on Proton Drive) but the cloud says otherwise. The upload
+        # should self-heal — recreate the folder and retry once — instead
+        # of just failing the whole run.
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            cfg = make_config(tmp)
+            manifest = Manifest(path=tmp / "manifest.json")
+            manifest.remote_dirs = [cfg.remote_path("Sync"), cfg.remote_path("Sync/Documents")]
+
+            origin = tmp / "a.txt"
+            origin.write_text("hello")
+            st = origin.stat()
+            member = Member("Sync/Documents/a.txt", origin, st.st_size, st.st_mtime_ns, sha256="x")
+            manifest.files["Sync/Documents/a.txt"] = member.to_entry_sync(uploaded="")
+
+            upload_attempts = 0
+            create_folder_calls: list[tuple] = []
+
+            def fake(cfg_, *args, **kwargs):
+                nonlocal upload_attempts
+                if args[:2] == ("filesystem", "upload"):
+                    upload_attempts += 1
+                    if upload_attempts == 1:
+                        return fake_proc(returncode=1, stderr="Node not found: Documents")
+                    return fake_proc()
+                if args[:2] == ("filesystem", "create-folder"):
+                    create_folder_calls.append(args)
+                return fake_proc()
+
+            with mock.patch.object(proton_mod, "proton", side_effect=fake):
+                uploaded, error = proton_mod.upload_sync_files(cfg, manifest)
+
+            self.assertIsNone(error)
+            self.assertEqual(uploaded, 1)
+            self.assertEqual(upload_attempts, 2)  # failed once, retried, succeeded
+            # the stale cache entry was dropped and the folder recreated
+            self.assertTrue(any(c[3] == "Documents" for c in create_folder_calls))
+            self.assertTrue(manifest.files["Sync/Documents/a.txt"]["uploaded"])
+
+
+class ConfirmRemoteTest(unittest.TestCase):
+    def test_not_found_is_a_real_failure_not_a_trusted_pass(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_config(Path(tmp))
+
+            def fake(cfg_, *args, **kwargs):
+                return fake_proc(returncode=1, stderr="Node not found: a.txt")
+
+            with mock.patch.object(proton_mod, "proton", side_effect=fake):
+                ok = proton_mod.confirm_remote(cfg, cfg.remote_path("Sync/a.txt"), 5, "deadbeef")
+            self.assertFalse(ok)
+
+    def test_genuinely_ambiguous_failure_is_still_trusted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = make_config(Path(tmp))
+
+            def fake(cfg_, *args, **kwargs):
+                return fake_proc(returncode=1, stderr="temporary CLI hiccup")
+
+            with mock.patch.object(proton_mod, "proton", side_effect=fake):
+                ok = proton_mod.confirm_remote(cfg, cfg.remote_path("Sync/a.txt"), 5, "deadbeef")
+            self.assertTrue(ok)
 
 
 class OrphanRoutingTest(unittest.TestCase):

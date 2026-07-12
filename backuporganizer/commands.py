@@ -580,8 +580,11 @@ def cmd_recalculate_manifest(cfg: Config, json_out: bool = False) -> int:
     not downloaded — bandwidth for the whole tree isn't spent by surprise;
     see --restore to fetch a specific one if you want it back. A local
     entry claiming "uploaded" that isn't actually on the remote is reset to
-    pending (the next `run` re-uploads it). Orphans no longer present on
-    the remote are dropped (nothing left to delete-remote).
+    pending if its local original still exists (the next `run` re-uploads
+    it) — or, if the local original is *also* gone, removed outright: it's
+    gone from both sides, "pending forever with nothing to ever upload"
+    would just be a permanent, meaningless entry. Orphans no longer present
+    on the remote are dropped too (nothing left to delete-remote).
 
     Archive side (shallow): only confirms each chunk in manifest.chunks
     still exists remotely at the right size — does not attempt to recover
@@ -637,10 +640,16 @@ def cmd_recalculate_manifest(cfg: Config, json_out: bool = False) -> int:
             unmatched_no_local.append(arc)
 
     stale_cleared = []
-    for arc, entry in manifest.files.items():
-        if entry.get("source") == "sync" and entry.get("uploaded") and arc not in remote_by_arc:
+    removed_gone_from_both = []
+    for arc, entry in list(manifest.files.items()):
+        if entry.get("source") != "sync" or not entry.get("uploaded") or arc in remote_by_arc:
+            continue
+        if Path(entry["origin"]).is_file():
             entry["uploaded"] = ""
             stale_cleared.append(arc)
+        else:
+            del manifest.files[arc]
+            removed_gone_from_both.append(arc)
 
     orphans_cleared = []
     for arc in list(manifest.deleted_sync):
@@ -668,7 +677,8 @@ def cmd_recalculate_manifest(cfg: Config, json_out: bool = False) -> int:
             "remote_sync_files": len(remote_by_arc),
             "newly_recovered": newly_recovered, "confirmed_pending": confirmed_pending,
             "size_mismatch": size_mismatch, "unmatched_no_local": unmatched_no_local,
-            "stale_cleared": stale_cleared, "orphans_cleared": orphans_cleared,
+            "stale_cleared": stale_cleared, "removed_gone_from_both": removed_gone_from_both,
+            "orphans_cleared": orphans_cleared,
         },
         "archive": {"confirmed": archive_confirmed, "reset_to_pending": archive_reset},
     }
@@ -680,6 +690,7 @@ def cmd_recalculate_manifest(cfg: Config, json_out: bool = False) -> int:
               f"{len(s['newly_recovered'])} recovered, {len(s['confirmed_pending'])} confirmed, "
               f"{len(s['size_mismatch'])} size mismatch, {len(s['unmatched_no_local'])} unmatched "
               f"(no local original), {len(s['stale_cleared'])} reset to pending, "
+              f"{len(s['removed_gone_from_both'])} removed (gone from both), "
               f"{len(s['orphans_cleared'])} stale orphan(s) cleared.")
         a = result["archive"]
         print(f"Archive: {len(a['confirmed'])} chunk(s) confirmed, "

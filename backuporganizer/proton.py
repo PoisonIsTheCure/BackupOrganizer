@@ -6,6 +6,7 @@ import hashlib
 import json
 import re
 import subprocess
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable
@@ -17,8 +18,12 @@ from .util import human_size, log, now_iso
 SUBPROCESS_TIMEOUT = 15 * 60
 TRANSFER_TIMEOUT = 6 * 60 * 60  # multi-GB chunks on a slow uplink take a while
 
+CREATE_FOLDER_RETRIES = 3
+CREATE_FOLDER_BACKOFF_SECONDS = 1.5  # doubles each retry: 1.5s, 3s
+
 QUOTA_ERROR_RE = re.compile(r"quota|storage.*(full|exceed)|insufficient|not enough space", re.I)
 AUTH_ERROR_RE = re.compile(r"auth|login|session|unauthoriz|forbidden|credential|401|403", re.I)
+NOT_FOUND_RE = re.compile(r"not found", re.I)
 
 UPLOAD_FAIL_MESSAGES = {
     "quota": "Proton Drive storage is FULL — upload failed. Free up space in your plan.",
@@ -99,6 +104,33 @@ def list_remote_tree(cfg: Config, path: str) -> dict[str, dict]:
     return files
 
 
+def _create_folder(cfg: Config, parent: str, name: str) -> None:
+    """create-folder, tolerating 'already exists' and retrying a few times
+    with backoff on anything else — a lone transient hiccup (rate limiting,
+    a network blip) is expected across a run that can issue thousands of
+    these sequentially, and shouldn't abort the whole thing. Raises
+    UploadError only once retries are exhausted; a silently-swallowed
+    failure would mean every later call needing this folder as a parent
+    fails with a confusing "Node not found" instead of the real reason,
+    and (if also marked as if it succeeded) never gets retried either.
+    """
+    output = ""
+    for attempt in range(CREATE_FOLDER_RETRIES):
+        proc = proton(cfg, "filesystem", "create-folder", parent, name)
+        output = proc.stderr + proc.stdout
+        if proc.returncode == 0 or "exist" in output.lower():
+            return
+        if attempt < CREATE_FOLDER_RETRIES - 1:
+            log.warning("create-folder %s/%s failed (attempt %d/%d), retrying: %s",
+                       parent, name, attempt + 1, CREATE_FOLDER_RETRIES, output.strip()[:200])
+            time.sleep(CREATE_FOLDER_BACKOFF_SECONDS * (2 ** attempt))
+    raise UploadError(
+        classify_upload_error(output),
+        f"could not create remote folder {parent.rstrip('/')}/{name} "
+        f"after {CREATE_FOLDER_RETRIES} attempts: {output.strip()[:500]}",
+    )
+
+
 def ensure_remote_folder(cfg: Config) -> None:
     """Create each component of remote_folder; 'already exists' is fine.
 
@@ -108,9 +140,7 @@ def ensure_remote_folder(cfg: Config) -> None:
     parts = [p for p in cfg.remote_folder.split("/") if p]
     parent = "/" + parts[0]
     for part in parts[1:]:
-        proc = proton(cfg, "filesystem", "create-folder", parent, part)
-        if proc.returncode != 0 and "exist" not in (proc.stderr + proc.stdout).lower():
-            log.debug("create-folder %s/%s: %s", parent.rstrip("/"), part, proc.stderr.strip())
+        _create_folder(cfg, parent, part)
         parent = parent.rstrip("/") + "/" + part
 
 
@@ -120,7 +150,8 @@ def ensure_remote_dirs(cfg: Config, manifest: Manifest, remote_dirs: set[str]) -
     Folders are created top-down (a child's parent must exist first) and
     every newly-created path is recorded in manifest.remote_dirs so later
     runs skip it entirely instead of re-issuing create-folder calls for a
-    largely static sync tree.
+    largely static sync tree. A path that failed to create (see
+    _create_folder) is never recorded as known, so a later run retries it.
     """
     known = set(manifest.remote_dirs) | {cfg.remote_folder}
     needed: set[str] = set()
@@ -132,11 +163,21 @@ def ensure_remote_dirs(cfg: Config, manifest: Manifest, remote_dirs: set[str]) -
             needed.add(parent)
     for path in sorted(needed - known, key=lambda p: p.count("/")):
         parent, _, name = path.rpartition("/")
-        proc = proton(cfg, "filesystem", "create-folder", parent, name)
-        if proc.returncode != 0 and "exist" not in (proc.stderr + proc.stdout).lower():
-            log.debug("create-folder %s/%s: %s", parent, name, proc.stderr.strip())
+        _create_folder(cfg, parent, name)
         manifest.remote_dirs.append(path)
         known.add(path)
+
+
+def invalidate_remote_dir(manifest: Manifest, path: str) -> None:
+    """Drops path (and anything cached under it) from the remote_dirs cache
+    — used when an actual operation discovers the cache was wrong (the
+    cloud says the folder isn't there despite being marked known, e.g. from
+    a run before the create-folder fix, or someone deleting it by hand on
+    Proton Drive). The next ensure_remote_dirs call re-creates it instead
+    of continuing to trust a belief the cloud just contradicted."""
+    manifest.remote_dirs = [
+        d for d in manifest.remote_dirs if d != path and not d.startswith(path + "/")
+    ]
 
 
 def upload_file(cfg: Config, local: Path, remote_parent: str | None = None) -> None:
@@ -167,11 +208,19 @@ def confirm_remote(cfg: Config, remote_path: str, expect_size: int, expect_sha1:
 
     `filesystem info -j` reports the plaintext size (claimedSize) and a SHA-1
     digest claimed at upload time; both must match before the local copy may
-    be deleted. Returns False only on a *positive* mismatch; an unreadable or
-    unparseable response is trusted (the upload already exited 0)."""
+    be deleted. The manifest's belief that something is uploaded is only
+    ever as good as this check — a clear "not found" from the cloud is a
+    real negative (the local copy must NOT be deleted, the cloud isn't just
+    ambiguous, it's telling us the file isn't there) and is treated as one;
+    only a genuinely unreadable/unparseable response (a CLI hiccup, not a
+    verdict) is trusted, since the upload itself already exited 0."""
     try:
         proc = proton(cfg, "filesystem", "info", "-j", remote_path)
         if proc.returncode != 0:
+            output = proc.stderr + proc.stdout
+            if NOT_FOUND_RE.search(output):
+                log.error("Remote confirm of %s failed: not found on the cloud", remote_path)
+                return False
             log.debug("Remote confirm of %s unavailable: %s", remote_path, proc.stderr.strip())
             return True
         sizes: list[int] = []
@@ -344,7 +393,21 @@ def upload_sync_files(cfg: Config, manifest: Manifest,
         for parent in sorted(groups):
             group = groups[parent]
             log.info("Uploading %d sync file(s) to %s ...", len(group), parent)
-            upload_files(cfg, [m.origin for m in group], parent)
+            try:
+                upload_files(cfg, [m.origin for m in group], parent)
+            except UploadError as exc:
+                if not NOT_FOUND_RE.search(str(exc)):
+                    raise
+                # The manifest believed this folder existed (cached in
+                # remote_dirs) but the cloud says otherwise — recreate it
+                # and retry once rather than failing the whole run. This is
+                # the self-healing case: the manifest is only ever a cache
+                # of the cloud's state, not a substitute for it.
+                log.warning("Upload to %s failed (%s); recreating the folder and retrying once.",
+                           parent, exc)
+                invalidate_remote_dir(manifest, parent)
+                ensure_remote_dirs(cfg, manifest, {parent})
+                upload_files(cfg, [m.origin for m in group], parent)
 
         pool = ThreadPoolExecutor(max_workers=CONFIRM_WORKERS)
         try:

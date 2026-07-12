@@ -118,6 +118,8 @@ struct ActivityView: View {
                     recalculateRow("Size mismatch (re-verified)", s.sizeMismatch.count, .orange)
                     recalculateRow("Found on cloud, no local match", s.unmatchedNoLocal.count, .orange)
                     recalculateRow("Reset to pending (not actually on cloud)", s.staleCleared.count, .orange)
+                    recalculateRow("Removed (gone from both local and cloud)",
+                                   s.removedGoneFromBoth.count, .secondary)
                     recalculateRow("Stale orphans cleared", s.orphansCleared.count, .secondary)
                     Text("Archive: \(result.archive.confirmed.count) confirmed, "
                         + "\(result.archive.resetToPending.count) reset to pending")

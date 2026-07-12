@@ -246,6 +246,7 @@ struct RecalculateSyncResult: Codable, Equatable {
     var sizeMismatch: [String]
     var unmatchedNoLocal: [String]
     var staleCleared: [String]
+    var removedGoneFromBoth: [String]
     var orphansCleared: [String]
 
     enum CodingKeys: String, CodingKey {
@@ -255,6 +256,7 @@ struct RecalculateSyncResult: Codable, Equatable {
         case sizeMismatch = "size_mismatch"
         case unmatchedNoLocal = "unmatched_no_local"
         case staleCleared = "stale_cleared"
+        case removedGoneFromBoth = "removed_gone_from_both"
         case orphansCleared = "orphans_cleared"
     }
 }
