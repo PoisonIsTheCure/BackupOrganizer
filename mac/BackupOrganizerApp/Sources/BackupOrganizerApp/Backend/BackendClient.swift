@@ -8,6 +8,7 @@ import Foundation
 /// second, divergent implementation of the same rules).
 actor BackendClient {
     private let settings: AppSettings
+    private var activeRunProcess: Process?
 
     /// No default argument: `AppSettings.shared` is @MainActor-isolated,
     /// and this actor's init runs in a nonisolated context, so the caller
@@ -197,6 +198,7 @@ actor BackendClient {
                 var capturedLines: [String] = []
                 do {
                     try process.run()
+                    self.activeRunProcess = process
 
                     var sawResult = false
                     let decoder = JSONDecoder()
@@ -212,6 +214,7 @@ actor BackendClient {
                     let stderrData = try stderrPipe.fileHandleForReading.readToEndCompat()
                     process.waitUntilExit()
                     let stderrText = String(data: stderrData, encoding: .utf8) ?? ""
+                    self.activeRunProcess = nil
 
                     await ActivityLog.shared.record(command: displayCommand,
                                                     exitCode: process.terminationStatus,
@@ -225,6 +228,7 @@ actor BackendClient {
                             code: process.terminationStatus, stderr: stderrText))
                     }
                 } catch {
+                    self.activeRunProcess = nil
                     await ActivityLog.shared.record(command: displayCommand, exitCode: nil,
                                                     stdout: capturedLines.joined(separator: "\n"),
                                                     stderr: "", launchError: error.localizedDescription)
@@ -232,6 +236,16 @@ actor BackendClient {
                 }
             }
         }
+    }
+
+    /// Asks the active `run` to pause: sends SIGTERM, which the CLI treats
+    /// as "finish what's in flight, then stop cleanly" rather than a kill
+    /// (see install_pause_handler in util.py) — the run's own stream
+    /// keeps delivering progress events and ends normally with a
+    /// `{"event": "result", "paused": true}` line, it just doesn't throw.
+    /// A no-op if nothing is running.
+    func requestPause() {
+        activeRunProcess?.terminate()
     }
 
     /// Tail of backup_organizer.log — the Python side's own rotating log,

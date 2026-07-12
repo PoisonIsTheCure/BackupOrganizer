@@ -6,7 +6,9 @@ import datetime
 import hashlib
 import logging
 import logging.handlers
+import signal
 import subprocess
+import threading
 import zipfile
 from pathlib import Path
 
@@ -15,9 +17,32 @@ OSASCRIPT_BIN = "/usr/bin/osascript"
 
 log = logging.getLogger(APP_NAME)
 
+_pause_event = threading.Event()
+
 
 class BackupError(Exception):
     """A fatal, already-logged error; the message is user-facing."""
+
+
+def install_pause_handler() -> None:
+    """SIGTERM/SIGINT request a graceful pause instead of an immediate
+    kill: whatever's in flight (the current file, the current chunk)
+    finishes normally, no new work starts, and everything already saved
+    stays saved — a paused run is exactly as resumable as one that just
+    finished, since progress is saved incrementally either way. Without
+    this, killing a run (e.g. quitting the GUI mid-backup) crashes it with
+    a broken pipe / unhandled exception instead of stopping cleanly.
+    """
+    def handler(signum: int, frame: object) -> None:
+        log.warning("Pause requested (signal %d) — finishing in-flight work, then stopping.", signum)
+        _pause_event.set()
+    signal.signal(signal.SIGTERM, handler)
+    signal.signal(signal.SIGINT, handler)
+
+
+def pause_requested() -> bool:
+    """True once a SIGTERM/SIGINT has asked for a graceful stop."""
+    return _pause_event.is_set()
 
 
 def setup_logging(backup_dir: Path, verbose: bool) -> None:

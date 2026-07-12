@@ -182,6 +182,7 @@ struct ProgressEvent: Codable, Equatable {
 
     // result
     var ok: Bool?
+    var paused: Bool?
     var error: String?
     var errorKind: String?
     var syncUploaded: Int?
@@ -192,7 +193,7 @@ struct ProgressEvent: Codable, Equatable {
 
     enum CodingKeys: String, CodingKey {
         case event, added, changed, deleted, touched, dropzone, name, index, total,
-             files, count, arcname, ok, error, trashed, waiting
+             files, count, arcname, ok, paused, error, trashed, waiting
         case errorKind = "error_kind"
         case syncUploaded = "sync_uploaded"
         case archiveUploaded = "archive_uploaded"

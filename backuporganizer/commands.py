@@ -20,7 +20,7 @@ from .proton import (UPLOAD_FAIL_MESSAGES, UploadError, download_chunk, download
 from .scanner import (DROPZONE_SETTLE_SECONDS, diff_sync_dirs, find_sync_twins,
                       scan_dropzone, walk_files)
 from .util import (APP_NAME, BackupError, human_size, log, move_to_trash, notify,
-                   now_iso, sha256_file)
+                   now_iso, pause_requested, sha256_file)
 
 
 def cmd_backup(cfg: Config, do_upload: bool, dry_run: bool, notify_enabled: bool,
@@ -41,8 +41,19 @@ def cmd_backup(cfg: Config, do_upload: bool, dry_run: bool, notify_enabled: bool
     error is reported the same way rather than as a Python exception.
     """
     def emit(event: dict) -> None:
-        if json_out:
+        nonlocal json_out
+        if not json_out:
+            return
+        try:
             print(json.dumps(event), flush=True)
+        except BrokenPipeError:
+            # Whoever was reading our progress output (the GUI, a pipe into
+            # another command) is gone. The run itself already saved its
+            # progress incrementally — losing the ability to report the
+            # rest of it is not a reason to crash with an unhandled
+            # exception; just stop trying to emit further events.
+            log.warning("Progress output pipe closed; continuing without it.")
+            json_out = False
 
     manifest = Manifest.load(cfg.manifest_path)
     reconcile_chunks(cfg, manifest)
@@ -81,6 +92,10 @@ def cmd_backup(cfg: Config, do_upload: bool, dry_run: bool, notify_enabled: bool
         try:
             check_free_space(cfg, sum(p.total_bytes for p in new_arch_plans))
             for i, plan in enumerate(new_arch_plans, 1):
+                if pause_requested():
+                    log.warning("Paused before building %s; %d/%d chunk(s) built.",
+                               plan.name, i - 1, len(new_arch_plans))
+                    break
                 log.info("Building %s (%d file(s), %s)...",
                          plan.name, len(plan.members), human_size(plan.total_bytes))
                 manifest.chunks[plan.name] = build_chunk(cfg, plan)
@@ -130,7 +145,7 @@ def cmd_backup(cfg: Config, do_upload: bool, dry_run: bool, notify_enabled: bool
         if upload_error:
             log.error("Sync upload failed (%s): %s", upload_error.kind, upload_error)
 
-    if do_upload and upload_error is None:
+    if do_upload and upload_error is None and not pause_requested():
         trash_remote = list(manifest.pending_remote_cleanup)
         pending_chunk_upload = any(
             not meta["uploaded"] and cfg.chunk_path(name).is_file()
@@ -167,12 +182,14 @@ def cmd_backup(cfg: Config, do_upload: bool, dry_run: bool, notify_enabled: bool
     # ----- report ------------------------------------------------------------ #
     if upload_error:
         notify(APP_NAME, UPLOAD_FAIL_MESSAGES[upload_error.kind], notify_enabled)
-        emit({"event": "result", "ok": False, "error": str(upload_error),
+        emit({"event": "result", "ok": False, "paused": False, "error": str(upload_error),
              "error_kind": upload_error.kind, "added": len(diff.added),
              "changed": len(diff.changed), "deleted": len(diff.deleted),
              "sync_uploaded": sync_uploaded, "archive_uploaded": archive_uploaded,
              "freed_bytes": freed, "trashed": trashed, "waiting": waiting})
         return 1
+
+    paused = pause_requested()
     parts = [f"{len(diff.added)} added, {len(diff.changed)} updated, {len(diff.deleted)} removed"]
     if trashed or waiting:
         parts.append(f"{trashed} dropzone item(s) offloaded")
@@ -182,9 +199,13 @@ def cmd_backup(cfg: Config, do_upload: bool, dry_run: bool, notify_enabled: bool
         parts.append(f"{archive_uploaded} chunk(s) uploaded")
     if freed:
         parts.append(f"{human_size(freed)} freed locally")
-    notify(APP_NAME, "Backup OK — " + ", ".join(parts) + ".", notify_enabled)
-    emit({"event": "result", "ok": True, "error": None, "added": len(diff.added),
-         "changed": len(diff.changed), "deleted": len(diff.deleted),
+    if paused:
+        notify(APP_NAME, "Backup paused — " + ", ".join(parts)
+              + ". Run again anytime to pick up where it left off.", notify_enabled)
+    else:
+        notify(APP_NAME, "Backup OK — " + ", ".join(parts) + ".", notify_enabled)
+    emit({"event": "result", "ok": True, "paused": paused, "error": None,
+         "added": len(diff.added), "changed": len(diff.changed), "deleted": len(diff.deleted),
          "sync_uploaded": sync_uploaded, "archive_uploaded": archive_uploaded,
          "freed_bytes": freed, "trashed": trashed, "waiting": waiting})
     return 0

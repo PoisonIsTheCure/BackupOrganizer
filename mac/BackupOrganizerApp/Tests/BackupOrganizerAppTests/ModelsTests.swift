@@ -163,10 +163,12 @@ final class ModelsTests: XCTestCase {
              { XCTAssertEqual($0.name, "arch-00001.zip") }),
             (#"{"event": "dropzone_trashed", "name": "report.pdf"}"#,
              { XCTAssertEqual($0.name, "report.pdf") }),
-            (#"{"event": "result", "ok": true, "error": null, "added": 2, "changed": 1, "deleted": 0, "sync_uploaded": 5, "archive_uploaded": 2, "freed_bytes": 1024, "trashed": 1, "waiting": 0}"#,
+            (#"{"event": "result", "ok": true, "paused": false, "error": null, "added": 2, "changed": 1, "deleted": 0, "sync_uploaded": 5, "archive_uploaded": 2, "freed_bytes": 1024, "trashed": 1, "waiting": 0}"#,
              { XCTAssertEqual($0.ok, true); XCTAssertTrue($0.isTerminal); XCTAssertEqual($0.freedBytes, 1024) }),
-            (#"{"event": "result", "ok": false, "error": "quota exceeded", "error_kind": "quota"}"#,
+            (#"{"event": "result", "ok": false, "paused": false, "error": "quota exceeded", "error_kind": "quota"}"#,
              { XCTAssertEqual($0.ok, false); XCTAssertEqual($0.errorKind, "quota"); XCTAssertTrue($0.isTerminal) }),
+            (#"{"event": "result", "ok": true, "paused": true, "error": null, "sync_uploaded": 3, "archive_uploaded": 0}"#,
+             { XCTAssertEqual($0.ok, true); XCTAssertEqual($0.paused, true); XCTAssertTrue($0.isTerminal) }),
         ]
         for (json, check) in lines {
             let event = try JSONDecoder().decode(ProgressEvent.self, from: Data(json.utf8))

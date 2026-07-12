@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import os
 import sys
 from pathlib import Path
 
@@ -12,7 +13,7 @@ from .commands import (cmd_add_sync, cmd_advice, cmd_archive, cmd_backup,
                        cmd_log_tail, cmd_orphans, cmd_recalculate_manifest,
                        cmd_remove_sync, cmd_restore, cmd_retire_sync_twin, cmd_status)
 from .config import DEFAULT_CONFIG_PATH, Config, ConfigError
-from .util import APP_NAME, BackupError, log, notify, setup_logging
+from .util import APP_NAME, BackupError, install_pause_handler, log, notify, setup_logging
 from .viewer import cmd_browse, cmd_tree
 
 
@@ -104,6 +105,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     setup_logging(cfg.backup_dir, args.verbose)
+    install_pause_handler()
     notify_enabled = not args.no_notify
 
     # Read-only commands need no lock.
@@ -169,6 +171,19 @@ def main(argv: list[str] | None = None) -> int:
     except BackupError as exc:
         log.error("%s", exc)
         notify(APP_NAME, f"Backup FAILED: {exc}", notify_enabled)
+        return 1
+    except BrokenPipeError:
+        # Whoever was reading our stdout (the GUI, a shell pipe) is gone.
+        # cmd_backup's own JSON progress output already tolerates this;
+        # this is the safety net for everything else that still calls a
+        # bare print() (dry-run listings, human-readable --status, ...).
+        # Silence Python's noisy "Exception ignored" on shutdown by
+        # redirecting stdout to /dev/null before we exit.
+        try:
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, sys.stdout.fileno())
+        except OSError:
+            pass
         return 1
     except Exception:
         log.exception("Unexpected failure")

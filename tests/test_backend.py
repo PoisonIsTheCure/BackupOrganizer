@@ -4,12 +4,16 @@ orphan routing in cmd_backup."""
 
 from __future__ import annotations
 
+import contextlib
+import io
+import json
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
+from backuporganizer import commands as commands_mod
 from backuporganizer import proton as proton_mod
 from backuporganizer.commands import cmd_backup
 from backuporganizer.config import Config
@@ -187,6 +191,47 @@ class UploadSyncFilesGroupingTest(unittest.TestCase):
             for arc in files:
                 self.assertTrue(manifest.files[arc]["uploaded"])
 
+    def test_pause_stops_before_the_next_group_and_only_confirms_uploaded_ones(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            cfg = make_config(tmp)
+            manifest = Manifest(path=tmp / "manifest.json")
+
+            # Two groups, sorted "Sync/Documents" before "Sync/Other".
+            files = {
+                "Sync/Documents/a.txt": tmp / "a.txt",
+                "Sync/Other/b.txt": tmp / "b.txt",
+            }
+            for arc, origin in files.items():
+                origin.write_text(arc)
+                st = origin.stat()
+                member = Member(arc, origin, st.st_size, st.st_mtime_ns, sha256="x")
+                manifest.files[arc] = member.to_entry_sync(uploaded="")
+            # Pre-cache both folders so ensure_remote_dirs has nothing to
+            # create (and so no pause_requested() calls of its own) —
+            # isolates this test to the upload loop's own pause check.
+            manifest.remote_dirs = [
+                cfg.remote_path("Sync"), cfg.remote_path("Sync/Documents"),
+                cfg.remote_path("Sync/Other"),
+            ]
+
+            upload_calls: list[tuple] = []
+
+            def fake(cfg_, *args, **kwargs):
+                if args[:2] == ("filesystem", "upload"):
+                    upload_calls.append(args)
+                return fake_proc()
+
+            with mock.patch.object(proton_mod, "proton", side_effect=fake), \
+                 mock.patch.object(proton_mod, "pause_requested", side_effect=[False, True]):
+                uploaded, error = proton_mod.upload_sync_files(cfg, manifest)
+
+            self.assertIsNone(error)  # a pause is not a failure
+            self.assertEqual(uploaded, 1)
+            self.assertEqual(len(upload_calls), 1)  # only the first group was ever sent
+            self.assertTrue(manifest.files["Sync/Documents/a.txt"]["uploaded"])
+            self.assertFalse(manifest.files["Sync/Other/b.txt"]["uploaded"])  # untouched, resumable
+
     def test_missing_folder_is_recreated_and_upload_retried(self):
         # Regression test for the "Node not found: Documents" bug: the
         # manifest's remote_dirs cache believed a folder existed (as it
@@ -304,6 +349,60 @@ class OrphanRoutingTest(unittest.TestCase):
             manifest = Manifest.load(cfg.manifest_path)
             self.assertNotIn("Sync/sync/flaky.txt", manifest.deleted_sync)
             self.assertIn("Sync/sync/flaky.txt", manifest.files)
+
+
+class BrokenPipeTest(unittest.TestCase):
+    def test_emit_survives_broken_pipe_instead_of_crashing_the_run(self):
+        # Regression test: a reader disappearing mid-run (the GUI quit, a
+        # shell pipe closed) used to crash cmd_backup with an unhandled
+        # BrokenPipeError from inside emit()'s print() call — visible in
+        # the log as "Unexpected failure" with a traceback, even though
+        # the run's actual work (uploads, manifest saves) was already done.
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            sync_dir = tmp / "sync"
+            sync_dir.mkdir()
+            (tmp / "dropzone").mkdir()
+            (tmp / "backup").mkdir()
+            (sync_dir / "a.txt").write_text("hello")
+            cfg = make_config(tmp)
+
+            with mock.patch("backuporganizer.commands.print", side_effect=BrokenPipeError()):
+                rc = cmd_backup(cfg, do_upload=False, dry_run=False,
+                               notify_enabled=False, json_out=True)
+            self.assertEqual(rc, 0)  # completed normally, no unhandled exception
+
+            # the actual work still happened despite progress output failing
+            manifest = Manifest.load(cfg.manifest_path)
+            self.assertIn("Sync/sync/a.txt", manifest.files)
+
+
+class PauseReportingTest(unittest.TestCase):
+    def test_result_event_reports_paused_not_failed(self):
+        # A pause is a deliberate, clean stop, not a failure: the "result"
+        # event must say ok=true, paused=true — not look like an error to
+        # a caller (the GUI) that only checks "ok".
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            sync_dir = tmp / "sync"
+            sync_dir.mkdir()
+            (tmp / "dropzone").mkdir()
+            (tmp / "backup").mkdir()
+            (sync_dir / "a.txt").write_text("hello")
+            cfg = make_config(tmp)
+
+            stdout = io.StringIO()
+            with mock.patch.object(commands_mod, "pause_requested", return_value=True), \
+                 contextlib.redirect_stdout(stdout):
+                rc = cmd_backup(cfg, do_upload=False, dry_run=False,
+                               notify_enabled=False, json_out=True)
+            self.assertEqual(rc, 0)
+
+            lines = [json.loads(line) for line in stdout.getvalue().splitlines()]
+            result = next(e for e in lines if e["event"] == "result")
+            self.assertTrue(result["ok"])
+            self.assertTrue(result["paused"])
+            self.assertIsNone(result["error"])
 
 
 if __name__ == "__main__":

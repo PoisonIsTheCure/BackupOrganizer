@@ -13,7 +13,7 @@ from typing import Callable
 
 from .config import Config
 from .manifest import Manifest, Member
-from .util import human_size, log, now_iso
+from .util import human_size, log, now_iso, pause_requested
 
 SUBPROCESS_TIMEOUT = 15 * 60
 TRANSFER_TIMEOUT = 6 * 60 * 60  # multi-GB chunks on a slow uplink take a while
@@ -161,7 +161,15 @@ def ensure_remote_dirs(cfg: Config, manifest: Manifest, remote_dirs: set[str]) -
         for part in parts:
             parent = parent.rstrip("/") + "/" + part
             needed.add(parent)
-    for path in sorted(needed - known, key=lambda p: p.count("/")):
+    to_create = sorted(needed - known, key=lambda p: p.count("/"))
+    for i, path in enumerate(to_create):
+        if pause_requested():
+            # Whatever's created so far is real, cached progress — not
+            # wasted — a resumed run just won't re-issue these calls. The
+            # caller's own loop will see the pause too and stop before
+            # uploading into any folder we didn't get to.
+            log.warning("Paused during remote folder setup (%d/%d done).", i, len(to_create))
+            break
         parent, _, name = path.rpartition("/")
         _create_folder(cfg, parent, name)
         manifest.remote_dirs.append(path)
@@ -300,6 +308,10 @@ def upload_pending(cfg: Config, manifest: Manifest, trash_remote: list[str],
             if not meta["uploaded"] and cfg.chunk_path(name).is_file()
         )
         for name in pending:
+            if pause_requested():
+                log.warning("Paused before uploading %s; %d/%d chunk(s) done.",
+                           name, uploaded, len(pending))
+                break
             meta = manifest.chunks[name]
             local = cfg.chunk_path(name)
             log.info("Uploading %s (%s) ...", name, human_size(meta["size"]))
@@ -390,7 +402,13 @@ def upload_sync_files(cfg: Config, manifest: Manifest,
                 else cfg.remote_folder
             groups.setdefault(parent, []).append(m)
         ensure_remote_dirs(cfg, manifest, set(groups))
+        uploaded_groups: list[str] = []
         for parent in sorted(groups):
+            if pause_requested():
+                log.warning("Paused before uploading to %s; %d/%d director%s done.",
+                           parent, len(uploaded_groups), len(groups),
+                           "y" if len(uploaded_groups) == 1 else "ies")
+                break
             group = groups[parent]
             log.info("Uploading %d sync file(s) to %s ...", len(group), parent)
             try:
@@ -408,10 +426,15 @@ def upload_sync_files(cfg: Config, manifest: Manifest,
                 invalidate_remote_dir(manifest, parent)
                 ensure_remote_dirs(cfg, manifest, {parent})
                 upload_files(cfg, [m.origin for m in group], parent)
+            uploaded_groups.append(parent)
 
         pool = ThreadPoolExecutor(max_workers=CONFIRM_WORKERS)
         try:
-            futures = [pool.submit(confirm_one, m) for group in groups.values() for m in group]
+            # Only confirm files whose group actually finished uploading —
+            # a group skipped by a pause was never sent, so "confirming"
+            # it would just find it missing and wrongly report a failure.
+            futures = [pool.submit(confirm_one, m)
+                      for parent in uploaded_groups for m in groups[parent]]
             for future in as_completed(futures):
                 m, ok = future.result()
                 if not ok:

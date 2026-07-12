@@ -5,8 +5,10 @@ struct DashboardView: View {
     @State private var state: LoadState<StatusInfo> = .loading
 
     @State private var isRunning = false
+    @State private var isPausing = false
     @State private var progressEvents: [ProgressEvent] = []
     @State private var runFailed = false
+    @State private var runPaused = false
     @State private var runSummary: String?
 
     var body: some View {
@@ -36,6 +38,20 @@ struct DashboardView: View {
                 Label("Refresh", systemImage: "arrow.clockwise")
             }
             .disabled(isRunning)
+            if isRunning {
+                Button {
+                    Task { await pauseBackup() }
+                } label: {
+                    if isPausing {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Label("Pause", systemImage: "pause.fill")
+                    }
+                }
+                .disabled(isPausing)
+                .help("Finishes the current file/chunk, then stops cleanly. "
+                     + "Resume anytime by running the backup again.")
+            }
             Button {
                 Task { await runBackup() }
             } label: {
@@ -53,8 +69,9 @@ struct DashboardView: View {
     private var progressPanel: some View {
         VStack(alignment: .leading, spacing: 6) {
             if let runSummary {
-                Label(runSummary, systemImage: runFailed ? "xmark.octagon.fill" : "checkmark.circle.fill")
-                    .foregroundStyle(runFailed ? .red : .green)
+                Label(runSummary, systemImage: runFailed ? "xmark.octagon.fill"
+                     : runPaused ? "pause.circle.fill" : "checkmark.circle.fill")
+                    .foregroundStyle(runFailed ? .red : runPaused ? .orange : .green)
                     .font(.callout.bold())
             }
             ForEach(Array(progressEvents.suffix(6).enumerated()), id: \.offset) { _, event in
@@ -117,18 +134,27 @@ struct DashboardView: View {
 
     private func runBackup() async {
         isRunning = true
+        isPausing = false
         progressEvents = []
         runSummary = nil
         runFailed = false
+        runPaused = false
         do {
             for try await event in await client.runBackup() {
                 progressEvents.append(event)
                 if event.isTerminal {
                     runFailed = event.ok != true
-                    runSummary = event.ok == true
-                        ? "Backup complete — \(event.syncUploaded ?? 0) synced, "
-                          + "\(event.archiveUploaded ?? 0) chunk(s) uploaded."
-                        : "Backup failed: \(event.error ?? "unknown error")"
+                    runPaused = event.paused == true
+                    if event.paused == true {
+                        runSummary = "Paused — \(event.syncUploaded ?? 0) synced, "
+                            + "\(event.archiveUploaded ?? 0) chunk(s) uploaded so far. "
+                            + "Run Backup again anytime to resume."
+                    } else if event.ok == true {
+                        runSummary = "Backup complete — \(event.syncUploaded ?? 0) synced, "
+                            + "\(event.archiveUploaded ?? 0) chunk(s) uploaded."
+                    } else {
+                        runSummary = "Backup failed: \(event.error ?? "unknown error")"
+                    }
                 }
             }
         } catch {
@@ -136,7 +162,13 @@ struct DashboardView: View {
             runSummary = "Backup failed: \(error.localizedDescription)"
         }
         isRunning = false
+        isPausing = false
         await load()
+    }
+
+    private func pauseBackup() async {
+        isPausing = true
+        await client.requestPause()
     }
 
     private func describe(_ event: ProgressEvent) -> String {
@@ -157,6 +189,7 @@ struct DashboardView: View {
         case "dropzone_trashed":
             return "Archived and cleared: \(event.name ?? "")"
         case "result":
+            if event.paused == true { return "Paused." }
             return event.ok == true ? "Done." : "Failed: \(event.error ?? "unknown error")"
         default:
             return event.event
